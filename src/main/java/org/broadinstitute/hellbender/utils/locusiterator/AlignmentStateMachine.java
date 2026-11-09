@@ -2,7 +2,6 @@ package org.broadinstitute.hellbender.utils.locusiterator;
 
 import htsjdk.samtools.CigarElement;
 import htsjdk.samtools.CigarOperator;
-import org.broadinstitute.hellbender.exceptions.UserException;
 import org.broadinstitute.hellbender.utils.SimpleInterval;
 import org.broadinstitute.hellbender.utils.Utils;
 import org.broadinstitute.hellbender.utils.pileup.PileupElement;
@@ -268,7 +267,7 @@ public final class AlignmentStateMachine {
                     continue;
                 } else {
                     if (currentElement != null && currentElement.getOperator() == CigarOperator.D)
-                        throw new UserException.MalformedRead(read, "read ends with deletion. Cigar: " + read.getCigar().toString() + ". Although the SAM spec technically permits such reads, this is often indicative of malformed files.");
+                        throw ReadUtils.readEndsWithDeletionError(read);
 
                     // we're done, so set the offset of the cigar to 0 for cleanliness, as well as the current element
                     offsetIntoCurrentCigarElement = 0;
@@ -300,7 +299,7 @@ public final class AlignmentStateMachine {
                     break;
                 case D: // deletion w.r.t. the reference
                     if (readOffset < 0)             // we don't want reads starting with deletion, this is a malformed cigar string
-                        throw new UserException.MalformedRead(read, "read starts with deletion. Cigar: " + read.getCigar().toString() + ". Although the SAM spec technically permits such reads, this is often indicative of malformed files.");
+                        throw ReadUtils.readStartsWithDeletionError(read);
                     // should be the same as N case
                     genomeOffset++;
                     done = true;

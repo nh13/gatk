@@ -1136,6 +1136,22 @@ public final class ReadUtils {
     }
 
     /**
+     * @return the error for a read whose cigar starts with a deletion, which walks of a read's alignment, such as
+     *         {@link org.broadinstitute.hellbender.utils.locusiterator.AlignmentStateMachine}, reject
+     */
+    public static UserException.MalformedRead readStartsWithDeletionError(final GATKRead read) {
+        return new UserException.MalformedRead(read, "read starts with deletion. Cigar: " + read.getCigar().toString() + ". Although the SAM spec technically permits such reads, this is often indicative of malformed files.");
+    }
+
+    /**
+     * @return the error for a read whose cigar ends with a deletion, which walks of a read's alignment, such as
+     *         {@link org.broadinstitute.hellbender.utils.locusiterator.AlignmentStateMachine}, reject
+     */
+    public static UserException.MalformedRead readEndsWithDeletionError(final GATKRead read) {
+        return new UserException.MalformedRead(read, "read ends with deletion. Cigar: " + read.getCigar().toString() + ". Although the SAM spec technically permits such reads, this is often indicative of malformed files.");
+    }
+
+    /**
      * Pull out the sample names from a SAMFileHeader
      *
      * note that we use a TreeSet so that they are sorted

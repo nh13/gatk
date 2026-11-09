@@ -26,7 +26,6 @@ import org.broadinstitute.hellbender.utils.Utils;
 import org.broadinstitute.hellbender.utils.genotyper.AlleleLikelihoods;
 import org.broadinstitute.hellbender.utils.genotyper.SampleList;
 import org.broadinstitute.hellbender.utils.haplotype.Haplotype;
-import org.broadinstitute.hellbender.utils.locusiterator.AlignmentStateMachine;
 import org.broadinstitute.hellbender.utils.pileup.PileupElement;
 import org.broadinstitute.hellbender.utils.pileup.ReadPileup;
 import org.broadinstitute.hellbender.utils.read.AlignmentUtils;
@@ -353,12 +352,16 @@ public class ReferenceConfidenceModel {
     /**
      * Adds one read's evidence to every span position it aligns to.
      *
-     * The alignment is walked with the state machine a pileup uses, so the bases, deletions and cigar context seen here
-     * are those a pileup element would carry. Reference skips are not evidence, nor are bases inside the adaptor of a
-     * short fragment. A base contributes to the SNP likelihoods only above the base quality threshold, while every
-     * aligned base that is not part of, or immediately before, an indel contributes to the indel-informative count.
+     * The alignment is walked as the state machine a pileup uses walks it, so the bases, deletions and cigar context
+     * seen here are those a pileup element would carry, but a cigar element at a time and over the read's base and
+     * quality arrays rather than a step per position. Reference skips are not evidence, nor are bases inside the
+     * adaptor of a short fragment. A base contributes to the SNP likelihoods only above the base quality threshold,
+     * while every aligned base that is not part of, or immediately before, an indel contributes to the
+     * indel-informative count. A read that starts with a deletion, or that ends with one before passing the end of
+     * the span, is rejected as the state machine rejects it.
      */
-    private void sweepRead(final GATKRead read, final int spanStart, final int spanSize, final byte[] ref, final int globalRefOffset,
+    @VisibleForTesting
+    void sweepRead(final GATKRead read, final int spanStart, final int spanSize, final byte[] ref, final int globalRefOffset,
                            final double[][][] increments,
                            final RefVsAnyResult[] sites, final int[] readCounts, final int[] indelInformativeReads) {
         // When soft-clipped bases are not evidence, region finalization reverts every read's soft clips and records
@@ -366,88 +369,130 @@ public class ReferenceConfidenceModel {
         final boolean skipOriginalSoftClips = !useSoftClippedBases;
         final int originalSoftStart = skipOriginalSoftClips ? getOriginalSoftStart(read) : 0;
         final int originalSoftEnd = skipOriginalSoftClips ? getOriginalSoftEnd(read) : 0;
+        final int adaptorBoundary = ReadUtils.adaptorBoundaryForBaseChecks(read);
+        final boolean hasAdaptorBoundary = adaptorBoundary != ReadUtils.CANNOT_COMPUTE_ADAPTOR_BOUNDARY;
+        final boolean reverseStrand = read.isReverseStrand();
+        final byte[] bases = read.getBasesNoCopy();
+        final byte[] quals = read.getBaseQualitiesNoCopy();
+        final int spanEnd = spanStart + spanSize; // exclusive
 
-        final AlignmentStateMachine state = new AlignmentStateMachine(read);
-        int cigarElementIndex = -1;
+        // The offset of the last read base consumed and the last reference position stepped onto, as the state
+        // machine tracks them: a deletion's positions keep the offset of the base before it.
+        int readOffset = -1;
+        int position = read.getStart() - 1;
         // Reference-aligned read offset (insertions collapsed, deletions padded) at which the current cigar element starts.
         int alignedOffsetOfElement = 0;
         BitSet indelInformativeBases = null;
 
-        while (state.stepForwardOnGenome() != null) {
-            final int position = state.getGenomePosition();
-            if (position < spanStart) {
-                continue;
-            }
-            final int i = position - spanStart;
-            if (i >= spanSize) {
-                break;
-            }
-            final CigarElement element = state.getCurrentCigarElement();
+        // The cigar's own list, as the state machine walks: for a BAM record whose cigar is stored in its CG tag,
+        // numCigarElements() reports the placeholder cigar's length.
+        final List<CigarElement> elements = read.getCigarElements();
+        final int nElements = elements.size();
+        for (int elementIndex = 0; elementIndex < nElements; elementIndex++) {
+            final CigarElement element = elements.get(elementIndex);
             final CigarOperator op = element.getOperator();
-            if (op == CigarOperator.N) {
+            final int length = element.getLength();
+            if (length == 0 || op == CigarOperator.H || op == CigarOperator.P) {
                 continue;
             }
-            if (ReadUtils.isBaseInsideAdaptor(read, position)) {
+            if (op == CigarOperator.I || op == CigarOperator.S) {
+                readOffset += length;
+                alignedOffsetOfElement += alignedLength(element);
                 continue;
             }
-            final int elementIndex = state.getCurrentCigarElementOffset();
-            while (cigarElementIndex < elementIndex) {
-                if (cigarElementIndex >= 0) {
-                    alignedOffsetOfElement += alignedLength(read.getCigarElement(cigarElementIndex));
-                }
-                cigarElementIndex++;
-            }
-            final int readOffset = state.getReadOffset();
             final boolean isDeletion = op == CigarOperator.D;
-            final byte refBase = ref[i + globalRefOffset];
+            if (isDeletion && readOffset < 0) {
+                throw ReadUtils.readStartsWithDeletionError(read);
+            }
+            final int firstPosition = position + 1;
+            if (firstPosition >= spanEnd) {
+                return;
+            }
+            final int lastPosition = position + length;
+            if (op != CigarOperator.N) {
+                // a deletion's positions all carry the offset of the base before it; a match's step through the read
+                final int firstReadOffset = isDeletion ? readOffset : readOffset + 1;
+                final int readOffsetStep = isDeletion ? 0 : 1;
+                final int stop = Math.min(lastPosition, spanEnd - 1);
+                for (int p = Math.max(firstPosition, spanStart); p <= stop; p++) {
+                    if (hasAdaptorBoundary && ReadUtils.isPastAdaptorBoundary(reverseStrand, adaptorBoundary, p)) {
+                        continue;
+                    }
+                    final int i = p - spanStart;
+                    final int offsetInElement = p - firstPosition;
+                    final int baseOffset = firstReadOffset + readOffsetStep * offsetInElement;
+                    final byte refBase = ref[i + globalRefOffset];
 
-            final byte qual = isDeletion ? deletionQuality(read, readOffset, refBase, true) : read.getBaseQuality(readOffset);
-            final boolean usable = !((qual <= BASE_QUAL_THRESHOLD) && (flowBasedModel || !isDeletion))
-                    && !(skipOriginalSoftClips && (originalSoftStart > position || originalSoftEnd < position));
-            if (usable) {
-                readCounts[i]++;
-                final boolean isAlt = isDeletion || read.getBase(readOffset) != refBase;
-                applyRefVsNonRefLikelihoodAndCount(increments, sites[i], isAlt, qual, 1.0);
-            }
+                    final byte qual = isDeletion ? deletionQuality(read, baseOffset, refBase, true) : quals[baseOffset];
+                    final boolean usable = !((qual <= BASE_QUAL_THRESHOLD) && (flowBasedModel || !isDeletion))
+                            && !(skipOriginalSoftClips && (originalSoftStart > p || originalSoftEnd < p));
+                    if (usable) {
+                        readCounts[i]++;
+                        final boolean isAlt = isDeletion || bases[baseOffset] != refBase;
+                        applyRefVsNonRefLikelihoodAndCount(increments, sites[i], isAlt, qual, 1.0);
+                    }
 
-            // A position's indel-informative count is only used up to MAX_N_INDEL_INFORMATIVE_READS, so a position that
-            // has reached it is skipped. In deep pileups most positions are full before most reads arrive, so most
-            // reads never compute their indel-informative bases; a read that does computes them from the first
-            // position that still counts, and bits from there on do not depend on where the computation starts.
-            if (indelInformativeReads[i] >= MAX_N_INDEL_INFORMATIVE_READS) {
-                continue;
-            }
-            final int offsetInElement = state.getOffsetIntoCurrentCigarElement();
-            final boolean beforeIndel = offsetInElement == element.getLength() - 1
-                    && (nextOnGenomeOperatorIsDeletion(read, elementIndex) || nextOperatorIs(read, elementIndex, CigarOperator.I));
-            if (!isDeletion && !beforeIndel) {
-                final int alignedOffset = alignedOffsetOfElement + (alignedLength(element) > 0 ? offsetInElement : 0);
-                if (indelInformativeBases == null) {
-                    indelInformativeBases = indelInformativeBases(read, alignedOffset, ref, i + globalRefOffset, indelInformativeDepthIndelSize);
+                    // A position's indel-informative count is only used up to MAX_N_INDEL_INFORMATIVE_READS, so a position that
+                    // has reached it is skipped. In deep pileups most positions are full before most reads arrive, so most
+                    // reads never compute their indel-informative bases; a read that does computes them from the first
+                    // position that still counts, and bits from there on do not depend on where the computation starts.
+                    if (isDeletion || indelInformativeReads[i] >= MAX_N_INDEL_INFORMATIVE_READS) {
+                        continue;
+                    }
+                    final boolean beforeIndel = offsetInElement == length - 1
+                            && (nextOnGenomeOperatorIsDeletion(elements, elementIndex) || nextOperatorIs(elements, elementIndex, CigarOperator.I));
+                    if (!beforeIndel) {
+                        final int alignedOffset = alignedOffsetOfElement + offsetInElement;
+                        if (indelInformativeBases == null) {
+                            indelInformativeBases = indelInformativeBases(read, alignedOffset, ref, i + globalRefOffset, indelInformativeDepthIndelSize);
+                        }
+                        if (indelInformativeBases.get(alignedOffset)) {
+                            indelInformativeReads[i]++;
+                        }
+                    }
                 }
-                if (indelInformativeBases.get(alignedOffset)) {
-                    indelInformativeReads[i]++;
+                if (!isDeletion) {
+                    readOffset += length;
                 }
             }
+            if (lastPosition >= spanEnd) {
+                return;
+            }
+            position = lastPosition;
+            alignedOffsetOfElement += alignedLength(element);
+        }
+        if (nElements > 0 && elements.get(nElements - 1).getOperator() == CigarOperator.D) {
+            throw ReadUtils.readEndsWithDeletionError(read);
         }
     }
 
-    // Number of reference-aligned read offsets a cigar element spans: soft clips and reference-consuming operators
-    // count, insertions and hard clips do not.
-    private static int alignedLength(final CigarElement element) {
+    /**
+     * @return the number of reference-aligned read offsets a cigar element spans: soft clips and reference-consuming
+     *         operators count, insertions and hard clips do not
+     */
+    @VisibleForTesting
+    static int alignedLength(final CigarElement element) {
         final CigarOperator op = element.getOperator();
         return op.consumesReferenceBases() || op == CigarOperator.S ? element.getLength() : 0;
     }
 
-    private static boolean nextOperatorIs(final GATKRead read, final int elementIndex, final CigarOperator op) {
-        return elementIndex + 1 < read.numCigarElements() && read.getCigarElement(elementIndex + 1).getOperator() == op;
+    /**
+     * @return whether the cigar element right after the one at {@code elementIndex} exists and has operator {@code op}
+     */
+    @VisibleForTesting
+    static boolean nextOperatorIs(final List<CigarElement> elements, final int elementIndex, final CigarOperator op) {
+        return elementIndex + 1 < elements.size() && elements.get(elementIndex + 1).getOperator() == op;
     }
 
-    // Whether the next cigar element that consumes reference bases is a deletion, looking past clips, insertions and pads.
-    private static boolean nextOnGenomeOperatorIsDeletion(final GATKRead read, final int elementIndex) {
-        final int n = read.numCigarElements();
+    /**
+     * @return whether the next cigar element after the one at {@code elementIndex} that consumes reference bases is a
+     *         deletion, looking past clips, insertions and pads
+     */
+    @VisibleForTesting
+    static boolean nextOnGenomeOperatorIsDeletion(final List<CigarElement> elements, final int elementIndex) {
+        final int n = elements.size();
         for (int k = elementIndex + 1; k < n; k++) {
-            final CigarOperator op = read.getCigarElement(k).getOperator();
+            final CigarOperator op = elements.get(k).getOperator();
             if (op == CigarOperator.D) {
                 return true;
             } else if (op == CigarOperator.M || op == CigarOperator.EQ || op == CigarOperator.X) {
@@ -705,7 +750,14 @@ public class ReferenceConfidenceModel {
         return deletionQuality(p.getRead(), p.getOffset(), refBase, notInIsActive);
     }
 
-    private byte deletionQuality(final GATKRead read, final int offset, final byte refBase, final boolean notInIsActive) {
+    /**
+     * The quality of a deletion at a position whose read offset is that of the base before the deletion. Under the
+     * flow-based model, outside active region detection, a deletion followed by a base equal to {@code refBase} is taken
+     * as a left-aligned homopolymer deletion and gets that base's quality; every other deletion gets the constant
+     * reference model deletion quality.
+     */
+    @VisibleForTesting
+    byte deletionQuality(final GATKRead read, final int offset, final byte refBase, final boolean notInIsActive) {
         if (flowBasedModel && notInIsActive){
             if (read.getBase(offset + 1) == refBase){ // if hmer indel - assume that deletion is left aligned
                 return read.getBaseQuality(offset + 1);
@@ -722,7 +774,12 @@ public class ReferenceConfidenceModel {
         }
     }
 
-    private static void applyRefVsNonRefLikelihoodAndCount(final double[][][] increments, final RefVsAnyResult result, final boolean isAlt, final byte qual, final double altReadWeight) {
+    /**
+     * Adds one element's evidence to a site: counts it in the ref or non-ref depth and adds its genotype likelihood
+     * increments, weighted by {@code altReadWeight} if it is an alt element and by 1 otherwise.
+     */
+    @VisibleForTesting
+    static void applyRefVsNonRefLikelihoodAndCount(final double[][][] increments, final RefVsAnyResult result, final boolean isAlt, final byte qual, final double altReadWeight) {
         if (isAlt) {
             result.nonRefDepth++;
         } else {
