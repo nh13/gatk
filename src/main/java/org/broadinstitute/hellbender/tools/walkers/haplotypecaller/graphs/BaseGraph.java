@@ -78,6 +78,28 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
         return assemblySpecifics.containsVertex(v);
     }
 
+    /**
+     * The edges leaving {@code v}, in the order {@link #outgoingEdgesOf} iterates them, as a read-only list for hot
+     * loops that index it rather than allocate an iterator. The list is a view of the graph's storage, so the graph's
+     * edges must not be changed while it is in use.
+     *
+     * @throws IllegalArgumentException if {@code v} is not in the graph
+     */
+    protected final List<E> outgoingEdgeList(final V v) {
+        return assemblySpecifics.edges(v).outgoingList();
+    }
+
+    /**
+     * The edges entering {@code v}, in the order {@link #incomingEdgesOf} iterates them, as a read-only list for hot
+     * loops that index it rather than allocate an iterator. The list is a view of the graph's storage, so the graph's
+     * edges must not be changed while it is in use.
+     *
+     * @throws IllegalArgumentException if {@code v} is not in the graph
+     */
+    protected final List<E> incomingEdgeList(final V v) {
+        return assemblySpecifics.edges(v).incomingList();
+    }
+
     @Override
     public Set<E> outgoingEdgesOf(final V v) {
         return assemblySpecifics.outgoingEdgesOf(v);
@@ -158,7 +180,7 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
     public final boolean isReferenceNode( final V v ) {
         Utils.nonNull(v, "Attempting to test a null vertex.");
 
-        if (hasRefEdge(incomingEdgesOf(v)) || hasRefEdge(outgoingEdgesOf(v))) {
+        if (hasRefEdge(incomingEdgeList(v)) || hasRefEdge(outgoingEdgeList(v))) {
             return true;
         }
 
@@ -166,9 +188,10 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
         return vertexSet().size() == 1;
     }
 
-    private boolean hasRefEdge(final Set<E> edges) {
-        for (final E e : edges) {
-            if (e.isRef()) {
+    /** @return whether any of {@code edges} is a reference edge */
+    private boolean hasRefEdge(final List<E> edges) {
+        for (int i = 0; i < edges.size(); i++) {
+            if (edges.get(i).isRef()) {
                 return true;
             }
         }
@@ -274,12 +297,12 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
         Utils.nonNull(v, "Attempting to pull sequence from a null vertex.");
 
         // confirm that no incoming edges are reference edges
-        if (hasRefEdge(incomingEdgesOf(v))) {
+        if (hasRefEdge(incomingEdgeList(v))) {
             return false;
         }
 
         // confirm that there is an outgoing reference edge
-        if (hasRefEdge(outgoingEdgesOf(v))) {
+        if (hasRefEdge(outgoingEdgeList(v))) {
             return true;
         }
 
@@ -295,12 +318,12 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
         Utils.nonNull(v, "Attempting to pull sequence from a null vertex.");
 
         // confirm that no outgoing edges are reference edges
-        if (hasRefEdge(outgoingEdgesOf(v))) {
+        if (hasRefEdge(outgoingEdgeList(v))) {
             return false;
         }
 
         // confirm that there is an incoming reference edge
-        if (hasRefEdge(incomingEdgesOf(v))) {
+        if (hasRefEdge(incomingEdgeList(v))) {
             return true;
         }
 

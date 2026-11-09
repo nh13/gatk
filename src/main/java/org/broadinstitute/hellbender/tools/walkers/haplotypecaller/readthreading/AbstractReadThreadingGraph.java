@@ -929,6 +929,11 @@ public abstract class AbstractReadThreadingGraph extends BaseGraph<MultiDeBruijn
         return true;
     }
 
+    /**
+     * Walks back from {@code vertex} along the kmer {@code originalKmer}, from base {@code offset} down to base 0, and
+     * adds the sequence's count to each incoming edge whose source's suffix matches the kmer's base. A vertex with more
+     * than one incoming edge is passed through only when {@code increaseCountsThroughBranches} is set.
+     */
     private void increaseCountsInMatchedKmers(final SequenceForKmers seqForKmers,
                                               final MultiDeBruijnVertex vertex,
                                               final byte[] originalKmer,
@@ -937,11 +942,14 @@ public abstract class AbstractReadThreadingGraph extends BaseGraph<MultiDeBruijn
             return;
         }
 
-        for (final MultiSampleEdge edge : incomingEdgesOf(vertex)) {
+        // Only multiplicities change below, never edges, so the list can be indexed while recursing.
+        final List<MultiSampleEdge> incomingEdges = incomingEdgeList(vertex);
+        for (int j = 0; j < incomingEdges.size(); j++) {
+            final MultiSampleEdge edge = incomingEdges.get(j);
             final MultiDeBruijnVertex prev = getEdgeSource(edge);
             final byte suffix = prev.getSuffix();
             final byte seqBase = originalKmer[offset];
-            if (suffix == seqBase && (increaseCountsThroughBranches || inDegreeOf(vertex) == 1)) {
+            if (suffix == seqBase && (increaseCountsThroughBranches || incomingEdges.size() == 1)) {
                 edge.incMultiplicity(seqForKmers.count);
                 increaseCountsInMatchedKmers(seqForKmers, prev, originalKmer, offset - 1);
             }
@@ -1007,12 +1015,13 @@ public abstract class AbstractReadThreadingGraph extends BaseGraph<MultiDeBruijn
      * @return a non-null vertex connecting prevVertex to in the graph based on sequence
      */
     protected MultiDeBruijnVertex extendChainByOne(final MultiDeBruijnVertex prevVertex, final byte[] sequence, final int kmerStart, final int count, final boolean isRef) {
-        final Set<MultiSampleEdge> outgoingEdges = outgoingEdgesOf(prevVertex);
+        final List<MultiSampleEdge> outgoingEdges = outgoingEdgeList(prevVertex);
 
-        final int nextPos = kmerStart + kmerSize - 1;
-        for (final MultiSampleEdge outgoingEdge : outgoingEdges) {
+        final byte nextBase = sequence[kmerStart + kmerSize - 1];
+        for (int j = 0; j < outgoingEdges.size(); j++) {
+            final MultiSampleEdge outgoingEdge = outgoingEdges.get(j);
             final MultiDeBruijnVertex target = getEdgeTarget(outgoingEdge);
-            if (target.getSuffix() == sequence[nextPos]) {
+            if (target.getSuffix() == nextBase) {
                 // we've got a match in the chain, so simply increase the count of the edge by 1 and continue
                 outgoingEdge.incMultiplicity(count);
                 return target;
@@ -1025,7 +1034,7 @@ public abstract class AbstractReadThreadingGraph extends BaseGraph<MultiDeBruijn
 
         // either use our merge vertex, or create a new one in the chain
         final MultiDeBruijnVertex nextVertex = mergeVertex == null ? createVertex(kmer) : mergeVertex;
-        // nextVertex's suffix is sequence[nextPos] and no outgoing edge above led to that suffix, so there is no edge
+        // nextVertex's suffix is nextBase and no outgoing edge above led to that suffix, so there is no edge
         // from prevVertex to nextVertex yet
         addEdgeWhereNoneExists(prevVertex, nextVertex, ((MyEdgeFactory) getEdgeFactory()).createEdge(isRef, count));
         return nextVertex;

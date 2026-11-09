@@ -166,6 +166,26 @@ public final class AssemblyGraphSpecificsUnitTest extends GATKBaseTest {
         }
     }
 
+    @Test
+    public void theEdgeListsAreReadOnlyViewsInIterationOrder() {
+        final SeqGraph g = new SeqGraph(11);
+        final SeqVertex a = new SeqVertex("A");
+        final SeqVertex b = new SeqVertex("C");
+        final SeqVertex c = new SeqVertex("G");
+        g.addVertices(a, b, c);
+        g.addEdge(a, c);
+        g.addEdge(a, b);
+        g.addEdge(b, c);
+        Assert.assertEquals(g.outgoingEdgeList(a), new ArrayList<>(g.outgoingEdgesOf(a)));
+        Assert.assertEquals(g.incomingEdgeList(c), new ArrayList<>(g.incomingEdgesOf(c)));
+        Assert.assertThrows(UnsupportedOperationException.class, () -> g.outgoingEdgeList(a).remove(0));
+        Assert.assertThrows(UnsupportedOperationException.class, () -> g.incomingEdgeList(c).add(new BaseEdge(false, 1)));
+        // a view, so it follows later edits
+        final List<BaseEdge> out = g.outgoingEdgeList(b);
+        g.addEdge(b, a);
+        Assert.assertEquals(out.size(), 2);
+    }
+
     /** Vertices and edges as lists of vertices and of (source, target) pairs, in insertion order. */
     private static final class GraphModel {
         final List<SeqVertex> vertices = new ArrayList<>();

@@ -9,6 +9,7 @@ import java.util.AbstractSet;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -55,6 +56,8 @@ final class AssemblyGraphSpecifics<V extends BaseVertex, E> implements Specifics
         final ArrayUnenforcedSet<E> outgoing = new ArrayUnenforcedSet<>(1);
         private transient Set<E> unmodifiableIncoming = null;
         private transient Set<E> unmodifiableOutgoing = null;
+        private transient List<E> incomingList = null;
+        private transient List<E> outgoingList = null;
 
         private VertexEdges(final AssemblyGraphSpecifics<?, ?> owner, final V vertex) {
             this.owner = owner;
@@ -75,6 +78,22 @@ final class AssemblyGraphSpecifics<V extends BaseVertex, E> implements Specifics
                 unmodifiableOutgoing = Collections.unmodifiableSet(outgoing);
             }
             return unmodifiableOutgoing;
+        }
+
+        /** The incoming edges as a read-only list, for loops that index them. */
+        List<E> incomingList() {
+            if (incomingList == null) {
+                incomingList = Collections.unmodifiableList(incoming);
+            }
+            return incomingList;
+        }
+
+        /** The outgoing edges as a read-only list, for loops that index them. */
+        List<E> outgoingList() {
+            if (outgoingList == null) {
+                outgoingList = Collections.unmodifiableList(outgoing);
+            }
+            return outgoingList;
         }
     }
 
