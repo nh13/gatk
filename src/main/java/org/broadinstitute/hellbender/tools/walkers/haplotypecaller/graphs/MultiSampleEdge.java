@@ -4,8 +4,8 @@ import com.google.common.annotations.VisibleForTesting;
 import org.broadinstitute.hellbender.utils.Utils;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.util.PriorityQueue;
 
 /**
  * Edge class for connecting nodes in the graph that tracks some per-sample information.
@@ -28,12 +28,22 @@ import java.util.PriorityQueue;
  * </pre>
  */
 public final class MultiSampleEdge extends BaseEdge {
-    private static final long serialVersionUID = 1L;
+    // 2: single-sample multiplicities held in a sorted int array rather than a priority queue
+    private static final long serialVersionUID = 2L;
     private int currentSingleSampleMultiplicity;
     private final int singleSampleCapacity;
-    private final PriorityQueue<Integer> singleSampleMultiplicities;
 
-    private final List<Integer> referencePathIndexes = new ArrayList<>(2);
+    /**
+     * The retained single-sample multiplicities in ascending order, in the first {@link #retainedCount} slots: the
+     * {@code singleSampleCapacity} largest of the initial multiplicity and the flushed ones, held as primitives so an
+     * edge costs one small array rather than a priority queue of boxed values. The extra slot lets a flushed value be
+     * inserted in place, in order, before the lowest value is shifted out.
+     */
+    private final int[] retainedMultiplicities;
+    private int retainedCount;
+
+    /** Allocated on the first {@link #addReferenceIndex}, which only junction-tree assembly calls. */
+    private List<Integer> referencePathIndexes = null;
 
     /**
      * Create a new MultiSampleEdge with weight multiplicity and, if isRef == true, indicates a path through the reference
@@ -46,8 +56,9 @@ public final class MultiSampleEdge extends BaseEdge {
         super(isRef, multiplicity);
 
         Utils.validateArg( singleSampleCapacity > 0, () -> "singleSampleCapacity must be > 0 but found: " + singleSampleCapacity);
-        singleSampleMultiplicities = new PriorityQueue<>(singleSampleCapacity);
-        singleSampleMultiplicities.add(multiplicity);
+        retainedMultiplicities = new int[singleSampleCapacity + 1];
+        retainedMultiplicities[0] = multiplicity;
+        retainedCount = 1;
         currentSingleSampleMultiplicity = multiplicity;
         this.singleSampleCapacity = singleSampleCapacity;
     }
@@ -62,26 +73,44 @@ public final class MultiSampleEdge extends BaseEdge {
         return new MultiSampleEdge(isRef(), getMultiplicity(), singleSampleCapacity);
     }
 
+    /**
+     * Create a new edge equal to this one in every respect: {@link #copy()}, plus the current and retained per-sample
+     * multiplicities and a copy of the reference path indexes.
+     */
     @Override
     public MultiSampleEdge duplicate() {
         final MultiSampleEdge duplicate = copy();
         duplicate.currentSingleSampleMultiplicity = currentSingleSampleMultiplicity;
-        duplicate.singleSampleMultiplicities.clear();
-        duplicate.singleSampleMultiplicities.addAll(singleSampleMultiplicities);
-        duplicate.referencePathIndexes.addAll(referencePathIndexes);
+        System.arraycopy(retainedMultiplicities, 0, duplicate.retainedMultiplicities, 0, retainedCount);
+        duplicate.retainedCount = retainedCount;
+        if (referencePathIndexes != null) {
+            duplicate.referencePathIndexes = new ArrayList<>(referencePathIndexes);
+        }
         return duplicate;
     }
 
     /**
-     * update the single sample multiplicities by adding the current single sample multiplicity to the priority queue, and
+     * update the single sample multiplicities by adding the current single sample multiplicity to the retained ones, and
      * reset the current single sample multiplicity to 0.
      */
     public void flushSingleSampleMultiplicity() {
-        singleSampleMultiplicities.add(currentSingleSampleMultiplicity);
-        if( singleSampleMultiplicities.size() == singleSampleCapacity + 1 ) {
-            singleSampleMultiplicities.poll(); // remove the lowest multiplicity from the list
-        } else if( singleSampleMultiplicities.size() > singleSampleCapacity + 1 ) {
-            throw new IllegalStateException("Somehow the per sample multiplicity list has grown too big: " + singleSampleMultiplicities);
+        if (retainedCount == singleSampleCapacity && currentSingleSampleMultiplicity <= retainedMultiplicities[0]) {
+            // the new value would be the lowest, or tie with it, and be dropped at once, leaving the same values
+            currentSingleSampleMultiplicity = 0;
+            return;
+        }
+        // insert in ascending order, after any equal values
+        int i = retainedCount;
+        while (i > 0 && retainedMultiplicities[i - 1] > currentSingleSampleMultiplicity) {
+            retainedMultiplicities[i] = retainedMultiplicities[i - 1];
+            i--;
+        }
+        retainedMultiplicities[i] = currentSingleSampleMultiplicity;
+        retainedCount++;
+        if (retainedCount == singleSampleCapacity + 1) {
+            // remove the lowest multiplicity from the list
+            System.arraycopy(retainedMultiplicities, 1, retainedMultiplicities, 0, singleSampleCapacity);
+            retainedCount--;
         }
         currentSingleSampleMultiplicity = 0;
     }
@@ -94,7 +123,7 @@ public final class MultiSampleEdge extends BaseEdge {
 
     @Override
     public int getPruningMultiplicity() {
-        return singleSampleMultiplicities.peek();
+        return retainedMultiplicities[0];
     }
 
     @Override
@@ -107,11 +136,21 @@ public final class MultiSampleEdge extends BaseEdge {
         return currentSingleSampleMultiplicity;
     }
 
+    /**
+     * Records that this edge is on the reference path at index {@code i}. The index list is allocated on the first call.
+     */
     public void addReferenceIndex(int i) {
+        if (referencePathIndexes == null) {
+            referencePathIndexes = new ArrayList<>(2);
+        }
         referencePathIndexes.add(i);
     }
 
+    /**
+     * @return the indexes of the reference path this edge is on, in the order they were added, as a read-only view
+     *         (empty if none were added)
+     */
     public List<Integer> getReferencePathIndexes() {
-        return referencePathIndexes;
+        return referencePathIndexes == null ? Collections.emptyList() : Collections.unmodifiableList(referencePathIndexes);
     }
 }

@@ -3,6 +3,7 @@ package org.broadinstitute.hellbender.tools.walkers.haplotypecaller.readthreadin
 import org.broadinstitute.hellbender.tools.walkers.haplotypecaller.graphs.BaseVertex;
 import org.broadinstitute.hellbender.utils.Utils;
 
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 
@@ -19,7 +20,8 @@ public final class MultiDeBruijnVertex extends BaseVertex {
 
     private static final boolean KEEP_TRACK_OF_READS = false;
 
-    private final List<String> reads = new LinkedList<>();
+    // An immutable empty list while reads are not tracked, so a vertex costs no list.
+    private final List<String> reads = KEEP_TRACK_OF_READS ? new LinkedList<>() : Collections.emptyList();
     private final boolean mergeIdenticalNodes;
     private final int hashCode;
 

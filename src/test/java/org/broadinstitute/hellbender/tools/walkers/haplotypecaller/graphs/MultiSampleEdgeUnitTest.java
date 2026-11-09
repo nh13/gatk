@@ -10,6 +10,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.PriorityQueue;
+import java.util.Random;
 
 public final class MultiSampleEdgeUnitTest extends GATKBaseTest {
 
@@ -103,6 +105,34 @@ public final class MultiSampleEdgeUnitTest extends GATKBaseTest {
     }
 
     @Test
+    public void aDuplicatesReferenceIndexesAreIndependentOfTheOriginals() {
+        final MultiSampleEdge edge = edgeWithSampleHistory();
+        final MultiSampleEdge duplicate = edge.duplicate();
+        duplicate.addReferenceIndex(13);
+        Assert.assertEquals(edge.getReferencePathIndexes(), List.of(7, 11));
+        Assert.assertEquals(duplicate.getReferencePathIndexes(), List.of(7, 11, 13));
+        edge.addReferenceIndex(17);
+        Assert.assertEquals(edge.getReferencePathIndexes(), List.of(7, 11, 17));
+        Assert.assertEquals(duplicate.getReferencePathIndexes(), List.of(7, 11, 13));
+
+        // an edge with no indexes yet duplicates to one that can still take them, without giving them to the original
+        final MultiSampleEdge bare = new MultiSampleEdge(false, 1, 1);
+        final MultiSampleEdge bareDuplicate = bare.duplicate();
+        bareDuplicate.addReferenceIndex(3);
+        Assert.assertEquals(bareDuplicate.getReferencePathIndexes(), List.of(3));
+        Assert.assertTrue(bare.getReferencePathIndexes().isEmpty());
+    }
+
+    @Test
+    public void theReferenceIndexesAreReadOnlyWhetherOrNotAnyWereAdded() {
+        final MultiSampleEdge edge = new MultiSampleEdge(false, 1, 1);
+        Assert.assertThrows(UnsupportedOperationException.class, () -> edge.getReferencePathIndexes().add(1));
+        edge.addReferenceIndex(2);
+        Assert.assertThrows(UnsupportedOperationException.class, () -> edge.getReferencePathIndexes().add(1));
+        Assert.assertEquals(edge.getReferencePathIndexes(), List.of(2));
+    }
+
+    @Test
     public void aDuplicateGoesOnToBehaveLikeTheOriginal() {
         final MultiSampleEdge edge = edgeWithSampleHistory();
         final MultiSampleEdge duplicate = edge.duplicate();
@@ -122,5 +152,39 @@ public final class MultiSampleEdgeUnitTest extends GATKBaseTest {
         Assert.assertEquals(copy.getPruningMultiplicity(), 14);
         Assert.assertEquals(copy.getCurrentSingleSampleMultiplicity(), 14);
         Assert.assertTrue(copy.getReferencePathIndexes().isEmpty());
+    }
+
+    /**
+     * The pruning multiplicity follows a priority queue that holds the initial multiplicity and every flushed one,
+     * dropping its lowest whenever it grows past the capacity, for any initial multiplicity and flush sequence.
+     */
+    @Test
+    public void thePruningMultiplicityMatchesABoundedPriorityQueue() {
+        final Random random = new Random(42);
+        for (int trial = 0; trial < 2000; trial++) {
+            final int capacity = 1 + random.nextInt(4);
+            final int initial = random.nextInt(6);
+            final MultiSampleEdge edge = new MultiSampleEdge(false, initial, capacity);
+            final PriorityQueue<Integer> model = new PriorityQueue<>();
+            model.add(initial);
+            int current = initial;
+            final int flushes = random.nextInt(8);
+            for (int f = 0; f < flushes; f++) {
+                final int increment = random.nextInt(7);
+                edge.incMultiplicity(increment);
+                current += increment;
+                if (random.nextBoolean()) {
+                    final MultiSampleEdge duplicate = edge.duplicate();
+                    Assert.assertEquals(duplicate.getPruningMultiplicity(), (int) model.peek());
+                }
+                edge.flushSingleSampleMultiplicity();
+                model.add(current);
+                if (model.size() == capacity + 1) {
+                    model.poll();
+                }
+                current = 0;
+                Assert.assertEquals(edge.getPruningMultiplicity(), (int) model.peek());
+            }
+        }
     }
 }
