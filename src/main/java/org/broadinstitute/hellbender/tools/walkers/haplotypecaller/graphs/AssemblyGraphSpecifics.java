@@ -6,6 +6,7 @@ import org.jgrapht.util.ArrayUnenforcedSet;
 
 import java.io.Serializable;
 import java.util.AbstractSet;
+import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -52,6 +53,8 @@ final class AssemblyGraphSpecifics<V extends BaseVertex, E> implements Specifics
         private final V vertex;
         /** False once the vertex has been removed from {@link #owner}. */
         private boolean inGraph = true;
+        /** Scratch count of incoming edges not yet removed, used only within {@link #hasCycles}. */
+        private int pendingIncoming;
         final ArrayUnenforcedSet<E> incoming = new ArrayUnenforcedSet<>(1);
         final ArrayUnenforcedSet<E> outgoing = new ArrayUnenforcedSet<>(1);
         private transient Set<E> unmodifiableIncoming = null;
@@ -131,6 +134,33 @@ final class AssemblyGraphSpecifics<V extends BaseVertex, E> implements Specifics
             }
         }
         return vertexMap.containsKey(o);
+    }
+
+    /**
+     * Whether the graph has a directed cycle, a self-loop included. Kahn's algorithm: repeatedly remove vertices with
+     * no remaining incoming edges; the graph is acyclic exactly when that removes every vertex.
+     */
+    boolean hasCycles() {
+        final ArrayDeque<VertexEdges<V, E>> ready = new ArrayDeque<>();
+        for (final VertexEdges<V, E> entry : vertexMap.values()) {
+            entry.pendingIncoming = entry.incoming.size();
+            if (entry.pendingIncoming == 0) {
+                ready.add(entry);
+            }
+        }
+        int removed = 0;
+        while (!ready.isEmpty()) {
+            final VertexEdges<V, E> entry = ready.poll();
+            removed++;
+            final ArrayUnenforcedSet<E> outgoing = entry.outgoing;
+            for (int i = 0; i < outgoing.size(); i++) {
+                final VertexEdges<V, E> target = edges(graph.getEdgeTarget(outgoing.get(i)));
+                if (--target.pendingIncoming == 0) {
+                    ready.add(target);
+                }
+            }
+        }
+        return removed != vertexMap.size();
     }
 
     @Override

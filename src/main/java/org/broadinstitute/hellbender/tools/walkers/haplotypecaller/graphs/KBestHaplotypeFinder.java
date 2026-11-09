@@ -3,7 +3,6 @@ package org.broadinstitute.hellbender.tools.walkers.haplotypecaller.graphs;
 import com.google.common.annotations.VisibleForTesting;
 import org.broadinstitute.hellbender.utils.BaseUtils;
 import org.broadinstitute.hellbender.utils.Utils;
-import org.jgrapht.alg.CycleDetector;
 
 import java.util.*;
 
@@ -35,7 +34,7 @@ public abstract class KBestHaplotypeFinder<V extends BaseVertex, E extends BaseE
         if (keepCycles()) {
             return graph;
         } else {
-            return new CycleDetector<>(graph).detectCycles() ? removeCyclesAndVerticesThatDontLeadToSinks(graph, sources, sinks) : graph;
+            return graph.hasCycles() ? removeCyclesAndVerticesThatDontLeadToSinks(graph, sources, sinks) : graph;
         }
     }
 

@@ -5,7 +5,6 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.broadinstitute.hellbender.exceptions.UserException;
 import org.broadinstitute.hellbender.utils.Utils;
 import org.jgrapht.EdgeFactory;
-import org.jgrapht.alg.CycleDetector;
 import org.jgrapht.graph.AbstractBaseGraph;
 import org.jgrapht.graph.specifics.Specifics;
 
@@ -853,7 +852,7 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
      * @return {@code true} if the graph has cycles, {@code false} otherwise.
      */
     public final boolean hasCycles() {
-        return new CycleDetector<>(this).detectCycles();
+        return assemblySpecifics.hasCycles();
     }
 
     @Override

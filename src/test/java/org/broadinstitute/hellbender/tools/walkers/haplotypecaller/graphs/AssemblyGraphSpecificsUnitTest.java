@@ -2,6 +2,7 @@ package org.broadinstitute.hellbender.tools.walkers.haplotypecaller.graphs;
 
 import org.broadinstitute.hellbender.GATKBaseTest;
 import org.broadinstitute.hellbender.tools.walkers.haplotypecaller.readthreading.MultiDeBruijnVertex;
+import org.jgrapht.alg.CycleDetector;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
@@ -288,5 +289,35 @@ public final class AssemblyGraphSpecificsUnitTest extends GATKBaseTest {
                 }
             }
         }
+    }
+
+    /** The cycle check agrees with jgrapht's cycle detector on random graphs, self-loops and removals included. */
+    @Test
+    public void hasCyclesAgreesWithJgraphtsCycleDetector() {
+        final Random random = new Random(11);
+        int cyclic = 0;
+        for (int trial = 0; trial < 3000; trial++) {
+            final SeqGraph g = new SeqGraph(11);
+            final int n = 1 + random.nextInt(12);
+            final List<SeqVertex> vertices = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                vertices.add(new SeqVertex("A"));
+                g.addVertex(vertices.get(i));
+            }
+            final int nEdges = random.nextInt(2 * n);
+            for (int e = 0; e < nEdges; e++) {
+                final int from = random.nextInt(n);
+                // mostly forward edges, so that both acyclic and cyclic graphs are common
+                final int to = random.nextInt(8) == 0 ? random.nextInt(n) : from + random.nextInt(n - from);
+                g.addEdge(vertices.get(from), vertices.get(to));
+            }
+            if (random.nextInt(4) == 0) {
+                g.removeVertex(vertices.get(random.nextInt(n)));
+            }
+            final boolean expected = new CycleDetector<>(g).detectCycles();
+            Assert.assertEquals(g.hasCycles(), expected);
+            cyclic += expected ? 1 : 0;
+        }
+        Assert.assertTrue(cyclic > 100 && cyclic < 2900, "cyclic graphs: " + cyclic);
     }
 }
