@@ -248,11 +248,15 @@ public class ReadThreadingGraph extends AbstractReadThreadingGraph {
         return nonUniqueKmers;
     }
 
+    /**
+     * @return the unique vertex for {@code kmer} to merge the chain into, or null if there is none
+     * @throws IllegalStateException if a reference sequence would merge into an existing unique vertex
+     */
     @Override
     protected MultiDeBruijnVertex getNextKmerVertexForChainExtension(final Kmer kmer, final boolean isRef, final MultiDeBruijnVertex prevVertex) {
         final MultiDeBruijnVertex uniqueMergeVertex = getKmerVertex(kmer, false);
 
-        Utils.validate(!(isRef && uniqueMergeVertex != null), "Found a unique vertex to merge into the reference graph " + prevVertex + " -> " + uniqueMergeVertex);
+        Utils.validate(!(isRef && uniqueMergeVertex != null), () -> "Found a unique vertex to merge into the reference graph " + prevVertex + " -> " + uniqueMergeVertex);
 
         return uniqueMergeVertex;
     }

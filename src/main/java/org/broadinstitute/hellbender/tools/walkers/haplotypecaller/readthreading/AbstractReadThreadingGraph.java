@@ -1143,7 +1143,7 @@ public abstract class AbstractReadThreadingGraph extends BaseGraph<MultiDeBruijn
             Utils.nonNull(sequence, "Sequence is null ");
             Utils.validateArg(start >= 0, () -> "Invalid start " + start);
             Utils.validateArg(stop >= start, () -> "Invalid stop " + stop);
-            Utils.validateArg(count > 0, "Invalid count " + count);
+            Utils.validateArg(count > 0, () -> "Invalid count " + count);
 
             this.name = name;
             this.sequence = sequence;
