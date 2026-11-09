@@ -31,7 +31,9 @@ import java.util.stream.Collectors;
  */
 public class JunctionTreeLinkedDeBruijnGraph extends AbstractReadThreadingGraph {
     private static final long serialVersionUID = 1l;
-    private static final MultiDeBruijnVertex SYMBOLIC_END_VETEX = new MultiDeBruijnVertex(new byte[]{'_'});
+    // One per graph rather than one shared by every graph: a vertex points at its edges in the graph that last used it,
+    // so a shared vertex would keep that graph reachable and be written by every thread that assembles.
+    private final MultiDeBruijnVertex symbolicEndVertex = new MultiDeBruijnVertex(new byte[]{'_'});
     private MultiSampleEdge SYMBOLIC_END_EDGE;
 
     private Map<MultiDeBruijnVertex, ThreadingTree> readThreadingJunctionTrees = new HashMap<>();
@@ -424,8 +426,8 @@ public class JunctionTreeLinkedDeBruijnGraph extends AbstractReadThreadingGraph 
     public void generateJunctionTrees() {
         Utils.validate(alreadyBuilt, "Assembly graph has not been constructed, please call BuildGraphIfNecessary() before trying to thread reads to the graph");
         // Adding handle vertex to support symbolic end alleles
-        addVertex(SYMBOLIC_END_VETEX);
-        SYMBOLIC_END_EDGE = addEdge(getReferenceSinkVertex(), SYMBOLIC_END_VETEX);
+        addVertex(symbolicEndVertex);
+        SYMBOLIC_END_EDGE = addEdge(getReferenceSinkVertex(), symbolicEndVertex);
 
         readThreadingJunctionTrees = new HashMap<>();
         pending.values().stream().flatMap(Collection::stream).forEach(this::threadSequenceForJunctionTree);

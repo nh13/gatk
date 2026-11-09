@@ -7,12 +7,24 @@ import java.util.Arrays;
 
 /**
  * A graph vertex that holds some sequence information
+ *
+ * A vertex also points at its edges in the assembly graph ({@link BaseGraph}) that most recently added it or looked it
+ * up, so that graph finds them without a map lookup. Graph queries therefore write to the vertex, even read-only ones,
+ * and a vertex in several graphs (a graph and its clones) must be used by one thread at a time, as must all those
+ * graphs. The pointer keeps that graph reachable for as long as the vertex is, so a vertex should not outlive its
+ * graphs, nor be shared across graphs built independently, such as from a static field.
  */
 public class BaseVertex {
     /** placeholder to store additional information for debugging purposes */
     private String additionalInfo = "";
     protected final byte[] sequence;
     private final int cachedHashCode;
+
+    /**
+     * The edges of this vertex in the assembly graph that most recently added it or looked it up, for that graph's
+     * {@link AssemblyGraphSpecifics} to find without a map lookup. Only that class reads or writes it.
+     */
+    AssemblyGraphSpecifics.VertexEdges<?, ?> graphEdges = null;
 
     /**
      * Create a new sequence vertex with sequence

@@ -7,8 +7,6 @@ import org.broadinstitute.hellbender.utils.Utils;
 import org.jgrapht.EdgeFactory;
 import org.jgrapht.alg.CycleDetector;
 import org.jgrapht.graph.AbstractBaseGraph;
-import org.jgrapht.graph.specifics.DirectedEdgeContainer;
-import org.jgrapht.graph.specifics.DirectedSpecifics;
 import org.jgrapht.graph.specifics.Specifics;
 
 import java.io.File;
@@ -25,6 +23,11 @@ import java.util.stream.Collectors;
  * A graph never holds two edges between the same pair of vertices, and an edge object joins one pair of vertices for
  * life (see {@link BaseEdge}). The graph refuses parallel edges itself rather than through jgrapht, so jgrapht's
  * {@link #isAllowingMultipleEdges()} and {@link #getType()} report that parallel edges are allowed.
+ *
+ * Each vertex keeps a pointer to its edges in the graph that most recently added it or looked it up (see
+ * {@link BaseVertex}), so even read-only queries such as {@link #outDegreeOf} write to the vertex. A graph, its clones
+ * and any other graph sharing its vertices must therefore be used by one thread at a time. The pointer also keeps the
+ * last graph that used a vertex reachable for as long as the vertex is, so vertices should not outlive their graphs.
  */
 public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extends AbstractBaseGraph<V, E> {
     private static final long serialVersionUID = 1l;
@@ -55,10 +58,11 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
     }
 
     /**
-     * Uses plain directed specifics rather than jgrapht's default fast-lookup variant, which keeps an extra map
-     * from every (source, target) pair to its edges and allocates a pair per lookup. Assembly graphs have few edges
-     * per vertex, so scanning a vertex's outgoing edges is cheaper, and both keep vertices and edges in insertion
-     * order. Assembly graphs are always directed.
+     * Stores the graph in {@link AssemblyGraphSpecifics}: plain directed adjacency, as in jgrapht's
+     * {@code DirectedSpecifics}, rather than jgrapht's default fast-lookup variant, which keeps an extra map from every
+     * (source, target) pair to its edges and allocates a pair per lookup. Assembly graphs have few edges per vertex, so
+     * scanning a vertex's outgoing edges is cheaper. Vertices and edges are kept in insertion order, and a vertex points
+     * at its own edges, so adjacency queries need no map lookup. Assembly graphs are always directed.
      *
      * jgrapht's constructor and clone call this before this class's field initializers would run, so
      * {@link #assemblySpecifics} has none.
@@ -69,34 +73,9 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
         return assemblySpecifics;
     }
 
-    /**
-     * Directed specifics whose edge-container lookup rejects a vertex that is not in the graph, rather than adding
-     * it. That lets the adjacency queries below check membership and find the vertex's edges with one map lookup,
-     * where jgrapht's versions first assert membership with a separate lookup. A vertex is added with no container
-     * and gets one on first use, so only a vertex missing from the map is rejected.
-     */
-    private static final class AssemblyGraphSpecifics<V, E> extends DirectedSpecifics<V, E> {
-        private static final long serialVersionUID = 1L;
-
-        private AssemblyGraphSpecifics(final AbstractBaseGraph<V, E> graph) {
-            super(graph);
-        }
-
-        @Override
-        protected DirectedEdgeContainer<V, E> getEdgeContainer(final V vertex) {
-            final DirectedEdgeContainer<V, E> container = vertexMapDirected.get(vertex);
-            if (container != null) {
-                return container;
-            }
-            if (!vertexMapDirected.containsKey(vertex)) {
-                // The same exceptions as jgrapht's assertVertexExist.
-                if (vertex == null) {
-                    throw new NullPointerException();
-                }
-                throw new IllegalArgumentException("no such vertex in graph: " + vertex);
-            }
-            return super.getEdgeContainer(vertex);
-        }
+    @Override
+    public boolean containsVertex(final V v) {
+        return assemblySpecifics.containsVertex(v);
     }
 
     @Override
