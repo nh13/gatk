@@ -277,6 +277,10 @@ final class AssemblyGraphSpecifics<V extends BaseVertex, E> implements Specifics
     @Override
     public Set<E> edgesOf(final V vertex) {
         final VertexEdges<V, E> entry = edges(vertex);
+        if (entry.incoming.isEmpty() && entry.outgoing.isEmpty()) {
+            // pruning removes many vertices left without edges, each after asking for its edges
+            return Collections.emptySet();
+        }
         final ArrayUnenforcedSet<E> inAndOut = new ArrayUnenforcedSet<>(entry.incoming);
         inAndOut.addAll(entry.outgoing);
 
