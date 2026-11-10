@@ -77,7 +77,7 @@ public final class ReferenceConfidenceModelSweepUnitTest extends GATKBaseTest {
             final int globalRefOffset = random.nextInt(60);
             final int spanStart = PADDED_START + globalRefOffset;
             final int spanSize = 1 + random.nextInt(PADDED_SIZE - globalRefOffset - 60);
-            final Accumulators actual = new Accumulators(spanSize, ploidy);
+            final ReferenceConfidenceModel.SiteEvidence actual = new ReferenceConfidenceModel.SiteEvidence(spanSize, ploidy + 1);
             final Accumulators expected = new Accumulators(spanSize, ploidy);
             final int nReads = 1 + random.nextInt(60);
             for (int r = 0; r < nReads; r++) {
@@ -106,10 +106,10 @@ public final class ReferenceConfidenceModelSweepUnitTest extends GATKBaseTest {
      */
     private static RuntimeException sweepBoth(final ReferenceConfidenceModel model, final GATKRead read, final int spanStart, final int spanSize,
                                               final byte[] ref, final int globalRefOffset, final double[][][] increments,
-                                              final Accumulators actual, final Accumulators expected,
+                                              final ReferenceConfidenceModel.SiteEvidence actual, final Accumulators expected,
                                               final boolean useSoftClippedBases, final boolean flowBased) {
         final RuntimeException actualFailure = sweep(() -> model.sweepRead(read, spanStart, spanSize, ref, globalRefOffset,
-                increments, actual.sites, actual.readCounts, actual.indelInformativeReads));
+                increments, actual));
         final RuntimeException expectedFailure = sweep(() -> referenceSweep(model, read, spanStart, spanSize, ref, globalRefOffset,
                 increments, expected, useSoftClippedBases, flowBased));
         final String cigar = read.getCigar().toString();
@@ -126,7 +126,7 @@ public final class ReferenceConfidenceModelSweepUnitTest extends GATKBaseTest {
                         "unexpected failure for " + cigar + ": " + expectedFailure);
             }
             // A rejected read may have added part of its evidence; start both again from the same state.
-            actual.copyFrom(expected);
+            expected.copyTo(actual);
         }
         return expectedFailure;
     }
@@ -176,7 +176,7 @@ public final class ReferenceConfidenceModelSweepUnitTest extends GATKBaseTest {
                     read.setAttribute(ReferenceConfidenceModel.ORIGINAL_SOFTCLIP_START_TAG, read.getSoftStart());
                     read.setAttribute(ReferenceConfidenceModel.ORIGINAL_SOFTCLIP_END_TAG, read.getSoftEnd());
                 }
-                final Accumulators actual = new Accumulators(spanSize, ploidy);
+                final ReferenceConfidenceModel.SiteEvidence actual = new ReferenceConfidenceModel.SiteEvidence(spanSize, ploidy + 1);
                 final Accumulators expected = new Accumulators(spanSize, ploidy);
                 final RuntimeException failure = sweepBoth(model, read, spanStart, spanSize, ref, globalRefOffset, increments,
                         actual, expected, useSoftClippedBases, flowBased);
@@ -253,7 +253,7 @@ public final class ReferenceConfidenceModelSweepUnitTest extends GATKBaseTest {
         for (final int[] span : new int[][]{{1_100, 400}, {900, read.getEnd() - 900 + 50}}) {
             final int globalRefOffset = 20;
             final byte[] ref = randomBases(random, span[1] + 2 * globalRefOffset);
-            final Accumulators actual = new Accumulators(span[1], ploidy);
+            final ReferenceConfidenceModel.SiteEvidence actual = new ReferenceConfidenceModel.SiteEvidence(span[1], ploidy + 1);
             final Accumulators expected = new Accumulators(span[1], ploidy);
             final RuntimeException failure = sweepBoth(model, read, span[0], span[1], ref, globalRefOffset, increments,
                     actual, expected, true, false);
@@ -381,25 +381,26 @@ public final class ReferenceConfidenceModelSweepUnitTest extends GATKBaseTest {
             indelInformativeReads = new int[spanSize];
         }
 
-        void copyFrom(final Accumulators other) {
+        void copyTo(final ReferenceConfidenceModel.SiteEvidence evidence) {
             for (int i = 0; i < sites.length; i++) {
-                System.arraycopy(other.sites[i].genotypeLikelihoods, 0, sites[i].genotypeLikelihoods, 0, sites[i].genotypeLikelihoods.length);
-                sites[i].refDepth = other.sites[i].refDepth;
-                sites[i].nonRefDepth = other.sites[i].nonRefDepth;
+                System.arraycopy(sites[i].genotypeLikelihoods, 0, evidence.likelihoods, i * evidence.likelihoodCount, evidence.likelihoodCount);
+                evidence.refDepth[i] = sites[i].refDepth;
+                evidence.nonRefDepth[i] = sites[i].nonRefDepth;
             }
-            System.arraycopy(other.readCounts, 0, readCounts, 0, readCounts.length);
-            System.arraycopy(other.indelInformativeReads, 0, indelInformativeReads, 0, indelInformativeReads.length);
+            System.arraycopy(readCounts, 0, evidence.readCounts, 0, readCounts.length);
+            System.arraycopy(indelInformativeReads, 0, evidence.indelInformativeReads, 0, indelInformativeReads.length);
         }
 
-        void assertSameAs(final Accumulators actual) {
+        void assertSameAs(final ReferenceConfidenceModel.SiteEvidence actual) {
             Assert.assertEquals(actual.readCounts, readCounts);
             Assert.assertEquals(actual.indelInformativeReads, indelInformativeReads);
             for (int i = 0; i < sites.length; i++) {
-                Assert.assertEquals(actual.sites[i].refDepth, sites[i].refDepth, "refDepth at " + i);
-                Assert.assertEquals(actual.sites[i].nonRefDepth, sites[i].nonRefDepth, "nonRefDepth at " + i);
+                final RefVsAnyResult actualSite = actual.toResult(i);
+                Assert.assertEquals(actualSite.refDepth, sites[i].refDepth, "refDepth at " + i);
+                Assert.assertEquals(actualSite.nonRefDepth, sites[i].nonRefDepth, "nonRefDepth at " + i);
                 for (int k = 0; k < sites[i].genotypeLikelihoods.length; k++) {
                     // the same additions in the same order give the same bits
-                    Assert.assertEquals(Double.doubleToRawLongBits(actual.sites[i].genotypeLikelihoods[k]),
+                    Assert.assertEquals(Double.doubleToRawLongBits(actualSite.genotypeLikelihoods[k]),
                             Double.doubleToRawLongBits(sites[i].genotypeLikelihoods[k]), "likelihood " + k + " at " + i);
                 }
             }

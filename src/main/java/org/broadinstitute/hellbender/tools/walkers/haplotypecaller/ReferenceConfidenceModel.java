@@ -321,32 +321,73 @@ public class ReferenceConfidenceModel {
         final double log10Ploidy = Math.log10(ploidy);
         final double[][][] increments = likelihoodIncrements(ploidy);
 
-        final RefVsAnyResult[] sites = new RefVsAnyResult[spanSize];
-        for (int i = 0; i < spanSize; i++) {
-            sites[i] = new RefVsAnyResult(likelihoodCount);
-        }
-        final int[] readCounts = new int[spanSize];
-        final int[] indelInformativeReads = new int[spanSize];
-
+        final SiteEvidence evidence = new SiteEvidence(spanSize, likelihoodCount);
         final List<GATKRead> reads = new ArrayList<>(readLikelihoods.sampleEvidence(0));
         reads.sort(new ReadCoordinateComparator(activeRegion.getHeader()));
         for (final GATKRead read : reads) {
             if (read.getEnd() >= spanStart && read.getStart() <= span.getEnd()) {
-                sweepRead(read, spanStart, spanSize, ref, globalRefOffset, increments, sites, readCounts, indelInformativeReads);
+                sweepRead(read, spanStart, spanSize, ref, globalRefOffset, increments, evidence);
             }
         }
 
         final List<ReferenceConfidenceResult> results = new ArrayList<>(spanSize);
         for (int i = 0; i < spanSize; i++) {
-            final RefVsAnyResult site = sites[i];
-            final double denominator = readCounts[i] * log10Ploidy;
+            final RefVsAnyResult site = evidence.toResult(i);
+            final double denominator = evidence.readCounts[i] * log10Ploidy;
             for (int k = 0; k < likelihoodCount; k++) {
                 site.genotypeLikelihoods[k] -= denominator;
             }
-            applyIndelRefConfidence(ploidy, indelInformativeReads[i], site);
+            applyIndelRefConfidence(ploidy, evidence.indelInformativeReads[i], site);
             results.add(site);
         }
         return results;
+    }
+
+    /**
+     * The evidence the reads of a span add to each of its positions, in flat arrays indexed by position so that a read
+     * sweep writes to adjacent memory: the genotype likelihood sums, likelihood count entries per position, the ref
+     * and non-ref depths, the read counts and the indel-informative read counts.
+     */
+    @VisibleForTesting
+    static final class SiteEvidence {
+        final int likelihoodCount;
+        final double[] likelihoods;
+        final int[] refDepth;
+        final int[] nonRefDepth;
+        final int[] readCounts;
+        final int[] indelInformativeReads;
+
+        SiteEvidence(final int spanSize, final int likelihoodCount) {
+            this.likelihoodCount = likelihoodCount;
+            likelihoods = new double[spanSize * likelihoodCount];
+            refDepth = new int[spanSize];
+            nonRefDepth = new int[spanSize];
+            readCounts = new int[spanSize];
+            indelInformativeReads = new int[spanSize];
+        }
+
+        /**
+         * Adds one usable element's evidence at read weight 1 to a position: it counts the read, and adds to the
+         * depths and likelihoods as {@link #applyRefVsNonRefLikelihoodAndCount} adds to a {@link RefVsAnyResult}.
+         */
+        void add(final int i, final double[][][] increments, final boolean isAlt, final byte qual) {
+            readCounts[i]++;
+            if (isAlt) {
+                nonRefDepth[i]++;
+            } else {
+                refDepth[i]++;
+            }
+            addLikelihoodIncrements(increments, isAlt, qual, 1.0, likelihoods, i * likelihoodCount);
+        }
+
+        /** @return the result holding the likelihood sums and depths of position {@code i} */
+        RefVsAnyResult toResult(final int i) {
+            final RefVsAnyResult result = new RefVsAnyResult(likelihoodCount);
+            System.arraycopy(likelihoods, i * likelihoodCount, result.genotypeLikelihoods, 0, likelihoodCount);
+            result.refDepth = refDepth[i];
+            result.nonRefDepth = nonRefDepth[i];
+            return result;
+        }
     }
 
     /**
@@ -362,8 +403,8 @@ public class ReferenceConfidenceModel {
      */
     @VisibleForTesting
     void sweepRead(final GATKRead read, final int spanStart, final int spanSize, final byte[] ref, final int globalRefOffset,
-                           final double[][][] increments,
-                           final RefVsAnyResult[] sites, final int[] readCounts, final int[] indelInformativeReads) {
+                           final double[][][] increments, final SiteEvidence evidence) {
+        final int[] indelInformativeReads = evidence.indelInformativeReads;
         // When soft-clipped bases are not evidence, region finalization reverts every read's soft clips and records
         // where they were in these tags, so every read reaching here carries them.
         final boolean skipOriginalSoftClips = !useSoftClippedBases;
@@ -427,9 +468,8 @@ public class ReferenceConfidenceModel {
                     final boolean usable = !((qual <= BASE_QUAL_THRESHOLD) && (flowBasedModel || !isDeletion))
                             && !(skipOriginalSoftClips && (originalSoftStart > p || originalSoftEnd < p));
                     if (usable) {
-                        readCounts[i]++;
                         final boolean isAlt = isDeletion || bases[baseOffset] != refBase;
-                        applyRefVsNonRefLikelihoodAndCount(increments, sites[i], isAlt, qual, 1.0);
+                        evidence.add(i, increments, isAlt, qual);
                     }
 
                     // A position's indel-informative count is only used up to MAX_N_INDEL_INFORMATIVE_READS, so a position that
@@ -785,11 +825,19 @@ public class ReferenceConfidenceModel {
         } else {
             result.refDepth++;
         }
-        final double readWeight = isAlt ? altReadWeight : 1.0;
+        addLikelihoodIncrements(increments, isAlt, qual, isAlt ? altReadWeight : 1.0, result.genotypeLikelihoods, 0);
+    }
+
+    /**
+     * Adds the genotype likelihood increments of one element, of the given alt status and quality and at the given
+     * read weight, to the likelihoods of one position held from {@code offset} on. Both the pileup path and the read
+     * sweep add evidence with this; at a read weight of 1 the products are the increments themselves.
+     */
+    private static void addLikelihoodIncrements(final double[][][] increments, final boolean isAlt, final byte qual, final double readWeight,
+                                                final double[] likelihoods, final int offset) {
         final double[] entry = increments[isAlt ? 1 : 0][qual & 0xff];
-        final double[] genotypeLikelihoods = result.genotypeLikelihoods;
         for (int k = 0; k < entry.length; k++) {
-            genotypeLikelihoods[k] += readWeight * entry[k];
+            likelihoods[offset + k] += readWeight * entry[k];
         }
     }
 
