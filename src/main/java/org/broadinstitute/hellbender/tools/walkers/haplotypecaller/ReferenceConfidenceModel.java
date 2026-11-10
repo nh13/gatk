@@ -9,6 +9,7 @@ import htsjdk.samtools.util.Locatable;
 import htsjdk.variant.variantcontext.Allele;
 import htsjdk.variant.variantcontext.GenotypeBuilder;
 import htsjdk.variant.variantcontext.GenotypeLikelihoods;
+import htsjdk.variant.variantcontext.GenotypesContext;
 import htsjdk.variant.variantcontext.VariantContext;
 import htsjdk.variant.variantcontext.VariantContextBuilder;
 import htsjdk.variant.vcf.VCFHeaderLine;
@@ -570,11 +571,16 @@ public class ReferenceConfidenceModel {
         gb.AD(homRefCalc.getAD());
         gb.DP(homRefCalc.getDP());
         addGenotypeData(homRefCalc, gb);
+        // The genotype's alleles are the site's reference allele, so the builder's check that every genotype allele is
+        // one of the site's is skipped; the genotypes are made immutable as the checked path makes them.
+        final GenotypesContext genotypes = GenotypesContext.create(gb.make());
+        genotypes.immutable();
+        vcb.genotypesNoValidation(genotypes);
         if(!applyPriors) {
-            return vcb.genotypes(gb.make()).make();
+            return vcb.make();
         }
         else {
-            return PosteriorProbabilitiesUtils.calculatePosteriorProbs(vcb.genotypes(gb.make()).make(), VCpriors, numRefSamplesForPrior, options);
+            return PosteriorProbabilitiesUtils.calculatePosteriorProbs(vcb.make(), VCpriors, numRefSamplesForPrior, options);
             //TODO FIXME: after new-qual refactoring, these should be static calls to AF calculator
         }
     }
@@ -599,6 +605,13 @@ public class ReferenceConfidenceModel {
         homRefCalc.finalPhredScaledGenotypeLikelihoods = leastConfidenceGLs.getAsPLs();
     }
 
+    /**
+     * Adds a site's genotype data, here its PL and GQ, to the hom-ref genotype of a reference confidence site.
+     *
+     * An override may add fields or attributes but must not change the genotype's alleles: the genotype is built from
+     * the site's reference allele, so {@link #makeReferenceConfidenceVariantContext} skips checking that its alleles are
+     * among the site's.
+     */
     public void addGenotypeData(final ReferenceConfidenceResult result, final GenotypeBuilder gb) {
         final int[] pls = ((RefVsAnyResult)result).finalPhredScaledGenotypeLikelihoods;
         gb.PL(pls);
