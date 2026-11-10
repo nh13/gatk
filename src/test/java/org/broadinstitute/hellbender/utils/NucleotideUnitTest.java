@@ -383,6 +383,25 @@ public class NucleotideUnitTest {
     }
 
     @Test
+    public void testIntersectBytesMatchesIntersectValuesForEveryPairOfBytes() {
+        int intersecting = 0;
+        for (int a = Byte.MIN_VALUE; a <= Byte.MAX_VALUE; a++) {
+            for (int b = Byte.MIN_VALUE; b <= Byte.MAX_VALUE; b++) {
+                final boolean expected = Nucleotide.decode((byte) a).intersect(Nucleotide.decode((byte) b)) != Nucleotide.X;
+                Assert.assertEquals(Nucleotide.intersect((byte) a, (byte) b), expected, "bytes " + a + " and " + b);
+                if (expected) {
+                    intersecting++;
+                }
+            }
+        }
+        Assert.assertTrue(intersecting > 0);
+        Assert.assertTrue(Nucleotide.intersect((byte) 'a', (byte) 'N'));
+        Assert.assertTrue(Nucleotide.intersect((byte) 'R', (byte) 'G'));
+        Assert.assertFalse(Nucleotide.intersect((byte) 'A', (byte) 'C'));
+        Assert.assertFalse(Nucleotide.intersect((byte) 'A', (byte) '*'));
+    }
+
+    @Test
     public void testValueOfNegativeBase() {
         Assert.assertSame(Nucleotide.decode((byte) -10), Nucleotide.X);
     }

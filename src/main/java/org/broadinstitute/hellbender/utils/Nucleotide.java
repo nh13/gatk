@@ -126,6 +126,12 @@ public enum Nucleotide {
      */
     private static final int[] baseToOrdinal;
 
+    /**
+     * The mask of the value of each unsigned byte encoding, so that {@link #intersect(byte, byte)} reads two bytes
+     * rather than two values' fields.
+     */
+    private static final byte[] baseToMask;
+
     static {
         final Nucleotide[] values = values();
         NUMBER_OF_CONSTANTS = values.length;
@@ -147,6 +153,10 @@ public enum Nucleotide {
         // need to do u and U here as they are just aliases to T.
         baseToValue['u' & 0xFF] = baseToValue['U' & 0xFF] = U;
         baseToOrdinal['u' & 0xFF] = baseToOrdinal['U' & 0xFF] = U.ordinal();
+        baseToMask = new byte[1 << Byte.SIZE];
+        for (int i = 0; i < baseToMask.length; i++) {
+            baseToMask[i] = (byte) baseToValue[i].mask;
+        }
     }
 
     private final int mask;
@@ -376,7 +386,7 @@ public enum Nucleotide {
      * @return {@code true} iff the input nucleotides intersect.
      */
     public static boolean intersect(final byte a, final byte b) {
-        return (baseToValue[0xFF & a].mask & baseToValue[0xFF & b].mask) != 0;
+        return (baseToMask[0xFF & a] & baseToMask[0xFF & b]) != 0;
     }
 
     /**
