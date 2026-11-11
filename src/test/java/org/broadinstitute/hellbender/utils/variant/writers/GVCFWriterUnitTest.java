@@ -91,6 +91,25 @@ public class GVCFWriterUnitTest extends GATKBaseTest {
     }
 
     // A no-call reference record whose PLs don't favour hom-ref, which the writer passes through instead of banding
+    // A block tracking posteriors read from a genotype without PLs cannot take a genotype whose PLs, read as its
+    // posteriors, have a different number of values: the genotype starts a new block instead of failing the merge
+    @Test
+    public void testGenotypeWhosePosteriorsDifferInLengthStartsANewBlock() {
+        final MockVcfWriter mockWriter = new MockVcfWriter();
+        final GVCFWriter writer = new GVCFWriter(mockWriter, standardPartition);
+        final List<Allele> alleles = Arrays.asList(Allele.create("A", true), Allele.NON_REF_ALLELE);
+        final Genotype withPosteriors = new GenotypeBuilder(SAMPLE_NAME, Arrays.asList(alleles.get(0), alleles.get(0))).GQ(15)
+                .attribute(GATKVCFConstants.PHRED_SCALED_POSTERIORS_KEY, "0,15,150").make();
+        writer.add(new VariantContextBuilder("test", CHR1, 1, 1, alleles).genotypes(withPosteriors).make());
+
+        final Genotype longerPLs = new GenotypeBuilder(SAMPLE_NAME, Arrays.asList(alleles.get(0), alleles.get(0))).GQ(12)
+                .PL(new int[]{0, 12, 100, 12, 100, 100}).make();
+        Assert.assertFalse(writer.gvcfBlockCombiner.genotypeCanBeMergedInCurrentBlock(longerPLs));
+        writer.add(new VariantContextBuilder("test", CHR1, 2, 2, alleles).genotypes(longerPLs).make());
+        writer.close();
+        Assert.assertEquals(mockWriter.emitted.size(), 2);
+    }
+
     private static VariantContext makeNoCallRecordWithMinDP() {
         final Genotype g = new GenotypeBuilder(SAMPLE_NAME, Arrays.asList(Allele.NO_CALL, Allele.NO_CALL))
                 .DP(18).GQ(9).PL(new int[]{20, 0, 135}).attribute(GATKVCFConstants.MIN_DP_FORMAT_KEY, 18).make();
