@@ -216,6 +216,17 @@ public final class ReblockGVCF extends MultiVariantWalker {
     @VisibleForTesting
     ReblockingGVCFWriter vcfWriter;
 
+    /**
+     * Whether to flush the buffered reference blocks that end before each input record before reblocking it. The flush
+     * keeps the writer's buffer small and does not change the output, which tests check by turning it off.
+     */
+    @VisibleForTesting
+    boolean flushRefBlocksBeforeEachInput = true;
+
+    // The contig and start of the previous input record, to check that the input is coordinate-sorted
+    private String previousContig = null;
+    private int previousStart = 0;
+
     @Override
     public boolean useVariantAnnotations() { return true;}
 
@@ -378,14 +389,39 @@ public final class ReblockGVCF extends MultiVariantWalker {
         return keys;
     }
 
-    // get VariantContexts from input gVCFs and regenotype
+    /**
+     * Reblock one input GVCF record: check that it has a {@code <NON_REF>} allele and does not start before the previous
+     * record on its contig, flush the buffered reference blocks that end before it (if
+     * {@link #flushRefBlocksBeforeEachInput} is set, as it is by default), then drop the requested FORMAT annotations
+     * and regenotype it.
+     */
     @Override
     public void apply(VariantContext variant, ReadsContext reads, ReferenceContext ref, FeatureContext features) {
         if (!variant.hasAllele(Allele.NON_REF_ALLELE)) {
             throw new UserException("Variant Context at " + variant.getContig() + ":" + variant.getStart() + " does not contain a <NON-REF> allele. This tool is only intended for use with GVCFs.");
         }
+        checkInputIsSorted(variant);
+        if (flushRefBlocksBeforeEachInput) {
+            vcfWriter.flushBlocksEndingBefore(variant);
+        }
         VariantContext newVC = formatAnnotationsToRemove.size() > 0 ? removeVCFFormatAnnotations(variant) : variant;
         regenotypeVC(newVC);
+    }
+
+    /**
+     * The flush before each input record relies on no later record on the same contig starting before it, so
+     * out-of-order input would silently change the output. Records may share a start, as when several inputs are merged.
+     * Only records on the same contig are compared: the writer flushes all its blocks when the contig changes, and the
+     * flush does nothing for a record on another contig.
+     */
+    private void checkInputIsSorted(final VariantContext variant) {
+        if (variant.getContig().equals(previousContig) && variant.getStart() < previousStart) {
+            throw new UserException.BadInput("The input record at " + variant.getContig() + ":" + variant.getStart()
+                    + " starts before the previous input record at " + previousContig + ":" + previousStart
+                    + ". The input GVCFs must be coordinate-sorted.");
+        }
+        previousContig = variant.getContig();
+        previousStart = variant.getStart();
     }
 
     /**

@@ -30,6 +30,7 @@ public class ReblockingGVCFBlockCombiner extends GVCFBlockCombiner implements Pu
     /**
      * fields updated on the fly during GVCFWriter operation
      */
+    // the end of the output so far on the current contig, advanced by submit() and by flushBlocksEndingBefore()
     private int vcfOutputEnd = 0;
     private int bufferEnd = 0;
     final private boolean dropLowQuals;
@@ -95,7 +96,8 @@ public class ReblockingGVCFBlockCombiner extends GVCFBlockCombiner implements Pu
      * Add the input as a new reference block or write and remove ref blocks that end before the variantContext if it is variant
      * Trim ref block if the variant occurs in the middle of a block
      * @param variantContextToOutput may be variant or reference, can overlap existing ref blocks in buffer,
-     *                              but should never start before vcfOutputEnd
+     *                              but should never start before vcfOutputEnd, which {@link #flushBlocksEndingBefore}
+     *                              also advances
      */
     @Override
     public void submit(final VariantContext variantContextToOutput) {
@@ -141,15 +143,13 @@ public class ReblockingGVCFBlockCombiner extends GVCFBlockCombiner implements Pu
                 homRefBlockBuffer.sort(VCB_COMPARATOR);
                 return;
             }
-            int blockEnd = (int)builder.getStop();
             final int variantStart = variantContextToOutput.getStart();
-            if (blockEnd >= variantStart) {  //then trim out overlap
-                blockEnd = trimBlockToVariant(variantContextToOutput, completedBlocks, tailBuffer, builder);
+            if (builder.getStop() >= variantStart) {  //then trim out overlap
+                trimBlockToVariant(variantContextToOutput, completedBlocks, tailBuffer, builder);
             }
             //only flush ref blocks if we're outputting a variant, otherwise ref blocks can be out of order
             if (blockStart < variantStart && !isHomRef(g)) {
-                super.submit(builder.make());
-                vcfOutputEnd = blockEnd;
+                emitBufferedBlock(builder);
                 completedBlocks.add(builder);
             }
         }
@@ -181,13 +181,12 @@ public class ReblockingGVCFBlockCombiner extends GVCFBlockCombiner implements Pu
      * @param completedBlocks   the list of blocks that are finalized and will be removed from the buffer
      * @param tailBuffer    the list of ref blocks that will stay in the hom ref block buffer without getting output
      * @param builder   the current ref block, overlapping the variant
-     * @return  the new end of the current ref block
      */
-    private int trimBlockToVariant(final VariantContext variantContextToOutput, final List<VariantContextBuilder> completedBlocks,
+    private void trimBlockToVariant(final VariantContext variantContextToOutput, final List<VariantContextBuilder> completedBlocks,
                                    final List<VariantContextBuilder> tailBuffer, final VariantContextBuilder builder) {
         final int blockStart = (int)builder.getStart();
         final int variantEnd = variantContextToOutput.getEnd();
-        int blockEnd = (int)builder.getStop();
+        final int blockEnd = (int)builder.getStop();
         final int variantStart = variantContextToOutput.getStart();
         if (blockEnd > variantEnd && blockStart < variantStart) {  //then this block will be split -- add a post-variant block
             final VariantContextBuilder blockTailBuilder = new VariantContextBuilder(builder);
@@ -195,7 +194,6 @@ public class ReblockingGVCFBlockCombiner extends GVCFBlockCombiner implements Pu
             tailBuffer.add(blockTailBuilder);
             builder.stop(variantStart-1);
             builder.attribute(VCFConstants.END_KEY, variantStart-1);
-            blockEnd = variantStart-1;
         }
         if (blockStart < variantStart) { //right trim
             builder.attribute(VCFConstants.END_KEY, variantStart - 1);
@@ -214,7 +212,30 @@ public class ReblockingGVCFBlockCombiner extends GVCFBlockCombiner implements Pu
         if (builder.getStart() > builder.getStop()) {
             throw new GATKException.ShouldNeverReachHereException("builder start follows stop; current builder: " + builder.getStart() + " to " + builder.getStop());
         }
-        return blockEnd;
+    }
+
+    /**
+     * Flush the leading buffered reference blocks on {@code contig} that end before {@code position}, the start of the
+     * next input record. The input is coordinate-sorted, so nothing submitted later starts before that record and
+     * nothing can trim these blocks; the next variant would flush them first and unchanged anyway. This keeps the
+     * buffer, which is scanned and sorted on every submission, small.
+     */
+    void flushBlocksEndingBefore(final String contig, final int position) {
+        if (homRefBlockBuffer.isEmpty() || !contig.equals(currentContig)) {
+            return;
+        }
+        int flushed = 0;
+        while (flushed < homRefBlockBuffer.size() && homRefBlockBuffer.get(flushed).getStop() < position) {
+            final VariantContextBuilder builder = homRefBlockBuffer.get(flushed);
+            if (builder.getStop() < vcfOutputEnd) {
+                throw new IllegalStateException("Buffered reference block " + currentContig + ":" + builder.getStart() + "-"
+                        + builder.getStop() + " ends before position " + vcfOutputEnd + ", which was already output, when flushing"
+                        + " the blocks that end before the input record at " + contig + ":" + position);
+            }
+            emitBufferedBlock(builder);
+            flushed++;
+        }
+        homRefBlockBuffer.subList(0, flushed).clear();
     }
 
     /**
@@ -222,16 +243,22 @@ public class ReblockingGVCFBlockCombiner extends GVCFBlockCombiner implements Pu
      */
     private void flushRefBlockBuffer() {
         for (final VariantContextBuilder builder : homRefBlockBuffer) {
-            //toOutput.add(builder.make());
-            try {
-                super.submit(builder.make());
-            } catch (Exception e) {
-                throw new GATKException("builder threw an exception at " + builder.getContig() + ":" + builder.getStart(), e);
-            }
-            vcfOutputEnd = (int)builder.getStop();
+            emitBufferedBlock(builder);
         }
         homRefBlockBuffer.clear();
         bufferEnd = 0;
+    }
+
+    /**
+     * Pass a buffered reference block on to the band combiner; the output then reaches the block's end
+     */
+    private void emitBufferedBlock(final VariantContextBuilder builder) {
+        try {
+            super.submit(builder.make());
+        } catch (Exception e) {
+            throw new GATKException("builder threw an exception at " + builder.getContig() + ":" + builder.getStart(), e);
+        }
+        vcfOutputEnd = (int)builder.getStop();
     }
 
     /**
