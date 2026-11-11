@@ -98,6 +98,7 @@ Each batch is a tag on this branch (`4.7.0.0-hpgc-v1` to `4.7.0.0-hpgc-v5`), and
 | [`perf/inactive-region-trims`](https://github.com/tfenne/gatk/tree/perf/inactive-region-trims) | `hpgc-v3` | Small trims in inactive regions: hard-clipped reads are tracked only for pileup detection, a single-sample path for overlapping read pairs, and the median depth from an `int[]`. | No | within noise | within noise | within noise |
 | [`perf/lazy-called-haplotypes-message`](https://github.com/tfenne/gatk/tree/perf/lazy-called-haplotypes-message) | `hpgc-v3` | Builds the message for a validation check on the called haplotypes only when the check fails, instead of rendering every variant and haplotype of each region as a string. | No | within noise | within noise | within noise |
 | [`perf/fgkl-0.2.0`](https://github.com/tfenne/gatk/tree/perf/fgkl-0.2.0) | `hpgc-v4` | Updates fgkl to 0.2.0: Smith-Waterman fill 1.3–2.2x faster, and a PairHMM that shares the computation of haplotype suffixes as well as prefixes, cutting its kernel time by more than half. | PL and GQ at some sites; see [Concordance](#concordance) | −3.8% / −7.5% | −6.6% / −13.9% | −30.8% / −31.9% |
+| [`nh/hc-perf`](https://github.com/nh13/gatk/tree/nh/hc-perf) | — | Assembly graph vertices point at their own edges, so adjacency queries skip the vertex-map lookup; edge lists are indexed in read threading; cycle checks use Kahn's algorithm; edges keep their multiplicities in a primitive array. Reference confidence sweeps each read a cigar element at a time into flat per-position arrays, and skips the genotype allele check on its sites. IUPAC base intersection reads a primitive mask table. Not yet measured as above; on HG002 30x with an Apple M-series Mac, instructions retired fell 15.5% on a median shard (chr7:72–118 Mb) and 14.8% on an expensive one (chr1:92–156 Mb). | No | not yet measured | not yet measured | not yet measured |
 
 ### Joint calling
 
@@ -144,7 +145,7 @@ The alleles at these sites are mostly known to [gnomAD v4.1](https://gnomad.broa
 
 Build with `./gradlew localJar` (Java 17), or download the jar attached to the latest [release](https://github.com/tfenne/gatk/releases). Use WARP's HaplotypeCaller arguments, add `--max-effective-depth 100`, and request 1 vCPU and 4 GB per shard with `-Xmx3g`, the heap the whole-genome results above were measured with. Test on your own data before using a smaller heap.
 
-For joint calling, reblock with this branch's ReblockGVCF, and add `--genomicsdb-compression lz4` to GenomicsDBImport, or `zstd:1` if the workspace is copied between hosts that all have `libzstd`. From `hpgc-v5` the branch builds against the fork's GenomicsDB (`com.tfenne:genomicsdb:1.6.0`) and htsjdk 5.0.2, both on Maven Central.
+For joint calling, reblock with this branch's ReblockGVCF and WARP's arguments (`-do-qual-approx --floor-blocks -GQB 20 -GQB 30 -GQB 40`; GnarlyGenotyper skips any variant without the `QUALapprox` that `-do-qual-approx` adds), and add `--genomicsdb-compression lz4` to GenomicsDBImport, or `zstd:1` if the workspace is copied between hosts that all have `libzstd`. From `hpgc-v5` the branch builds against the fork's GenomicsDB (`com.tfenne:genomicsdb:1.6.0`) and htsjdk 5.0.2, both on Maven Central.
 
 ## How the branch is maintained
 
