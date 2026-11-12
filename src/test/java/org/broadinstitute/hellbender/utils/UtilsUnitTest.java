@@ -1057,4 +1057,39 @@ public final class UtilsUnitTest extends GATKBaseTest {
         Utils.concat(arr1, arr2, constructor);
     }
 
+
+    @Test
+    public void testRunWithRandomGenerators() {
+        Utils.resetRandomGenerator();
+        final double[] expectedShared = {Utils.getRandomGenerator().nextGaussian(), Utils.getRandomGenerator().nextGaussian(),
+                Utils.getRandomDataGenerator().nextUniform(0, 1)};
+        final Random seeded42 = new Random(42);
+        final double expectedScoped = seeded42.nextGaussian();
+        final double expectedScopedSecond = seeded42.nextGaussian();
+
+        Utils.resetRandomGenerator();
+        final double first = Utils.getRandomGenerator().nextGaussian();
+        // draws inside the call come from a generator seeded with 42 and leave the shared ones where they were, even
+        // between the two halves of a pair of Gaussians that java.util.Random caches
+        final double scoped = Utils.runWithRandomGenerators(42, () -> {
+            final double g = Utils.getRandomGenerator().nextGaussian();
+            Utils.getRandomDataGenerator().nextUniform(0, 1);
+            // a nested call gets its own generators and gives the outer ones back
+            final double nested = Utils.runWithRandomGenerators(7, () -> Utils.getRandomGenerator().nextGaussian());
+            Assert.assertEquals(nested, new Random(7).nextGaussian());
+            Assert.assertEquals(Utils.getRandomGenerator().nextGaussian(), expectedScopedSecond);
+            return g;
+        });
+        Assert.assertEquals(scoped, expectedScoped);
+        Assert.assertEquals(new double[]{first, Utils.getRandomGenerator().nextGaussian(), Utils.getRandomDataGenerator().nextUniform(0, 1)},
+                expectedShared);
+
+        // the shared generators are back even if the action throws
+        Utils.resetRandomGenerator();
+        Assert.assertThrows(IllegalStateException.class, () -> Utils.runWithRandomGenerators(42, () -> {
+            throw new IllegalStateException();
+        }));
+        Assert.assertEquals(Utils.getRandomGenerator().nextGaussian(), expectedShared[0]);
+        Utils.resetRandomGenerator();
+    }
 }

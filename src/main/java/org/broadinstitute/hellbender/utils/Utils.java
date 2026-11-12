@@ -53,12 +53,60 @@ public final class Utils {
     private static final Random randomGenerator = new Random(GATK_RANDOM_SEED);
     private static final RandomDataGenerator randomDataGenerator = new RandomDataGenerator(new Well19937c(GATK_RANDOM_SEED));
 
-    public static Random getRandomGenerator() { return randomGenerator; }
-    public static RandomDataGenerator getRandomDataGenerator() { return randomDataGenerator; }
+    // the generators runWithRandomGenerators gives the calling thread, if it is running one
+    private static final ThreadLocal<Random> scopedRandomGenerator = new ThreadLocal<>();
+    private static final ThreadLocal<RandomDataGenerator> scopedRandomDataGenerator = new ThreadLocal<>();
 
+    /**
+     * @return the shared random generator, or, inside {@link #runWithRandomGenerators}, that call's own generator
+     */
+    public static Random getRandomGenerator() {
+        final Random scoped = scopedRandomGenerator.get();
+        return scoped != null ? scoped : randomGenerator;
+    }
+
+    /**
+     * @return the shared random data generator, or, inside {@link #runWithRandomGenerators}, that call's own generator
+     */
+    public static RandomDataGenerator getRandomDataGenerator() {
+        final RandomDataGenerator scoped = scopedRandomDataGenerator.get();
+        return scoped != null ? scoped : randomDataGenerator;
+    }
+
+    /**
+     * Reseeds the shared generators (not those of a {@link #runWithRandomGenerators} call in progress).
+     */
     public static void resetRandomGenerator() {
         randomGenerator.setSeed(GATK_RANDOM_SEED);
         randomDataGenerator.reSeed(GATK_RANDOM_SEED);
+    }
+
+    /**
+     * Runs {@code action} with {@link #getRandomGenerator()} and {@link #getRandomDataGenerator()} returning new
+     * generators seeded with {@code seed} on the calling thread, and returns its result. Code in {@code action} that
+     * gets its generators from those methods then neither uses nor advances the shared ones, so an optional extra step
+     * can draw random numbers without changing what the rest of the run draws, and what it draws depends only on the
+     * seed. Generators obtained before the call (say, kept in a field) and work on other threads still use the shared
+     * ones. Calls may be nested; each restores the generators that were in use when it started, even if
+     * {@code action} throws.
+     */
+    public static <T> T runWithRandomGenerators(final long seed, final Supplier<T> action) {
+        nonNull(action);
+        final Random outerRandom = scopedRandomGenerator.get();
+        final RandomDataGenerator outerRandomData = scopedRandomDataGenerator.get();
+        scopedRandomGenerator.set(new Random(seed));
+        scopedRandomDataGenerator.set(new RandomDataGenerator(new Well19937c(seed)));
+        try {
+            return action.get();
+        } finally {
+            if (outerRandom == null) {
+                scopedRandomGenerator.remove();
+                scopedRandomDataGenerator.remove();
+            } else {
+                scopedRandomGenerator.set(outerRandom);
+                scopedRandomDataGenerator.set(outerRandomData);
+            }
+        }
     }
 
     private static final int TEXT_WARNING_WIDTH = 68;
