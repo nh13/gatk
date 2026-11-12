@@ -140,4 +140,28 @@ public class HaplotypeCallerEngineUnitTest extends GATKBaseTest {
             Assert.assertEquals(region.getReads(), Collections.singletonList(kept));
         }
     }
+
+    @Test
+    public void testPassesGenotypingFilters() {
+        // the filters genotyping applies, and that MAPQ-0 reads must pass to count for the rescue
+        final SAMFileHeader header = ArtificialReadUtils.createArtificialSamHeader(2, 1, 1000);
+        final GATKRead read = ArtificialReadUtils.createArtificialRead(header, "read", 0, 100, 50);
+        read.setMappingQuality(0);
+        read.setIsPaired(true);
+        read.setMatePosition(header.getSequence(0).getSequenceName(), 300);
+        Assert.assertTrue(HaplotypeCallerEngine.passesGenotypingFilters(read, 0, null));
+        Assert.assertFalse(HaplotypeCallerEngine.passesGenotypingFilters(read, 20, null));
+        read.setMatePosition(header.getSequence(1).getSequenceName(), 300);
+        Assert.assertFalse(HaplotypeCallerEngine.passesGenotypingFilters(read, 0, null));
+        final GATKRead shortRead = ArtificialReadUtils.createArtificialRead(header, "short", 0, 100, 5);
+        Assert.assertFalse(HaplotypeCallerEngine.passesGenotypingFilters(shortRead, 0, null));
+        // --keep-read-group: a read in another read group, or in none, is left out rather than failing
+        final GATKRead noReadGroup = ArtificialReadUtils.createArtificialRead(header, "noReadGroup", 0, 100, 50);
+        noReadGroup.setReadGroup(null);
+        Assert.assertFalse(HaplotypeCallerEngine.passesGenotypingFilters(noReadGroup, 0, "rg"));
+        noReadGroup.setReadGroup("other");
+        Assert.assertFalse(HaplotypeCallerEngine.passesGenotypingFilters(noReadGroup, 0, "rg"));
+        noReadGroup.setReadGroup("rg");
+        Assert.assertTrue(HaplotypeCallerEngine.passesGenotypingFilters(noReadGroup, 0, "rg"));
+    }
 }

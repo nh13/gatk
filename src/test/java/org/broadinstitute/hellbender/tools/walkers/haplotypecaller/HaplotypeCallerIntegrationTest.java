@@ -8,24 +8,35 @@ import htsjdk.variant.variantcontext.Allele;
 import htsjdk.variant.variantcontext.Genotype;
 import htsjdk.variant.variantcontext.GenotypeBuilder;
 import htsjdk.variant.variantcontext.VariantContext;
+import htsjdk.variant.variantcontext.VariantContextBuilder;
+import htsjdk.variant.variantcontext.writer.Options;
+import htsjdk.variant.variantcontext.writer.VariantContextWriter;
 import htsjdk.variant.vcf.VCFConstants;
+import htsjdk.variant.vcf.VCFFilterHeaderLine;
 import htsjdk.variant.vcf.VCFHeader;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.tuple.Pair;
+import org.broadinstitute.barclay.argparser.CommandLineException;
 import org.broadinstitute.hellbender.CommandLineProgramTest;
 import org.broadinstitute.hellbender.cmdline.StandardArgumentDefinitions;
 import org.broadinstitute.hellbender.cmdline.argumentcollections.IntervalArgumentCollection;
 import org.broadinstitute.hellbender.engine.FeatureDataSource;
 import org.broadinstitute.hellbender.engine.ReadsDataSource;
 import org.broadinstitute.hellbender.engine.ReadsPathDataSource;
+import org.broadinstitute.hellbender.engine.ReferenceDataSource;
 import org.broadinstitute.hellbender.engine.spark.AssemblyRegionArgumentCollection;
 import org.broadinstitute.hellbender.exceptions.UserException;
 import org.broadinstitute.hellbender.testutils.ArgumentsBuilder;
 import org.broadinstitute.hellbender.testutils.IntegrationTestSpec;
 import org.broadinstitute.hellbender.testutils.SamAssertionUtils;
 import org.broadinstitute.hellbender.testutils.VariantContextTestUtils;
+import org.broadinstitute.hellbender.tools.HaplotypeCallerSpark;
+import org.broadinstitute.hellbender.tools.walkers.CombineGVCFs;
+import org.broadinstitute.hellbender.tools.walkers.GenotypeGVCFs;
 import org.broadinstitute.hellbender.tools.walkers.genotyper.AlleleSubsettingUtils;
 import org.broadinstitute.hellbender.tools.walkers.genotyper.GenotypeCalculationArgumentCollection;
+import org.broadinstitute.hellbender.tools.walkers.variantutils.ReblockGVCF;
+import org.broadinstitute.hellbender.tools.walkers.variantutils.ValidateVariants;
 import org.broadinstitute.hellbender.utils.BaseUtils;
 import org.broadinstitute.hellbender.utils.SimpleInterval;
 import org.broadinstitute.hellbender.utils.Utils;
@@ -33,7 +44,9 @@ import org.broadinstitute.hellbender.utils.gcs.BucketUtils;
 import org.broadinstitute.hellbender.utils.io.IOUtils;
 import org.broadinstitute.hellbender.utils.pairhmm.PairHMM;
 import org.broadinstitute.hellbender.utils.read.GATKRead;
+import org.broadinstitute.hellbender.utils.read.ReadUtils;
 import org.broadinstitute.hellbender.utils.variant.GATKVCFConstants;
+import org.broadinstitute.hellbender.utils.variant.GATKVariantContextUtils;
 import org.broadinstitute.hellbender.utils.variant.HomoSapiensConstants;
 import org.testng.Assert;
 import org.testng.annotations.DataProvider;
@@ -2479,5 +2492,597 @@ public class HaplotypeCallerIntegrationTest extends CommandLineProgramTest {
         if ( ! UPDATE_EXACT_MATCH_EXPECTED_OUTPUTS ) {
             IntegrationTestSpec.assertEqualTextFiles(output, expected, "#");
         }
+    }
+
+    // 20 kb of chromosome 21 where many of the NA12878 test BAM's reads have MAPQ 0
+    private static final String MQ0_RESCUE_INTERVAL = "21:10000000-10020000";
+
+    /** @return the arguments of a DRAGEN-mode run on the rescue interval (or the given ones), the mode the rescue requires */
+    private ArgumentsBuilder mq0RescueArgs(final File output, final ReferenceConfidenceMode mode, final String... intervals) {
+        return mq0RescueArgsWithoutDragen(output, mode, intervals).addFlag(HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME);
+    }
+
+    /** @return the value --dragen-mode gives an argument */
+    private static String dragenModeValue(final String name) {
+        final String[] pairs = new HaplotypeCallerArgumentCollection().getDragenVersion3412NameValuePairs();
+        for (int i = 0; i < pairs.length; i += 2) {
+            if (pairs[i].equals(name)) {
+                return pairs[i + 1];
+            }
+        }
+        throw new IllegalArgumentException(name + " is not set by --dragen-mode");
+    }
+
+    private ArgumentsBuilder mq0RescueArgsWithoutDragen(final File output, final ReferenceConfidenceMode mode, final String... intervals) {
+        final ArgumentsBuilder args = new ArgumentsBuilder()
+                .addInput(NA12878_20_21_WGS_bam)
+                .addReference(b37_reference_20_21)
+                .addOutput(output)
+                .add(AssemblyBasedCallerArgumentCollection.EMIT_REF_CONFIDENCE_LONG_NAME, mode)
+                .add(StandardArgumentDefinitions.ADD_OUTPUT_VCF_COMMANDLINE, false);
+        for (final String interval : intervals.length == 0 ? new String[]{MQ0_RESCUE_INTERVAL} : intervals) {
+            args.addInterval(interval);
+        }
+        return args;
+    }
+
+    // outputs of the runs several tests share, by mode and whether rescue is on
+    private final Map<String, File> mq0RescueRuns = new HashMap<>();
+
+    private synchronized File mq0RescueRun(final ReferenceConfidenceMode mode, final boolean rescue) {
+        return mq0RescueRuns.computeIfAbsent(mode + "." + rescue, key -> {
+            final File output = createTempFile("mq0Rescue." + key, mode == ReferenceConfidenceMode.NONE ? ".vcf" : ".g.vcf");
+            final ArgumentsBuilder args = mq0RescueArgs(output, mode);
+            if (rescue) {
+                args.addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+            }
+            runCommandLine(args);
+            return output;
+        });
+    }
+
+    private static final String GVCF_BLOCK_ALT = "<NON_REF>";
+
+    private static boolean isMq0RescueRecord(final VariantContext vc) {
+        return vc.hasAttribute(GATKVCFConstants.MQ0_RESCUE_KEY);
+    }
+
+    private static List<String> dataLines(final File vcf) throws IOException {
+        return Files.readAllLines(vcf.toPath()).stream().filter(line -> !line.startsWith("#")).collect(Collectors.toList());
+    }
+
+    /** @return the number of reads with MAPQ 0 (or above 0) that HaplotypeCaller's other read filters keep, overlapping a position */
+    private static int countBamReads(final String contig, final int pos, final boolean mq0) {
+        try (final ReadsDataSource reads = new ReadsPathDataSource(IOUtils.getPath(NA12878_20_21_WGS_bam))) {
+            int n = 0;
+            for (final Iterator<GATKRead> it = reads.query(new SimpleInterval(contig, pos, pos)); it.hasNext(); ) {
+                final GATKRead r = it.next();
+                if (!r.isUnmapped() && !r.isSecondaryAlignment() && !r.isDuplicate() && !r.failsVendorQualityCheck()
+                        && (mq0 == (r.getMappingQuality() == 0))) {
+                    n++;
+                }
+            }
+            return n;
+        }
+    }
+
+    @DataProvider
+    public Object[][] mq0RescueModes() {
+        return new Object[][]{{ReferenceConfidenceMode.GVCF}, {ReferenceConfidenceMode.NONE}, {ReferenceConfidenceMode.BP_RESOLUTION}};
+    }
+
+    /**
+     * With --mq0-rescue the output is the regular output with the rescue records merged in: non-reference calls whose
+     * alleles MAPQ-0 reads carry, marked, away from the regular calls, overlapping no other record.
+     */
+    @Test(dataProvider = "mq0RescueModes")
+    public void testMq0Rescue(final ReferenceConfidenceMode mode) throws IOException {
+        assertMq0RescueOutput(mq0RescueRun(mode, false), mq0RescueRun(mode, true), mode);
+    }
+
+    /**
+     * @return whether a record is a call, worked out here rather than with the code under test: a non-reference,
+     * non-symbolic alternate allele, a called genotype carrying one, and QUAL at least the rescue's minimum
+     */
+    private static boolean isCallForTest(final VariantContext vc) {
+        final double minCallQual = new Mq0RescueArgumentCollection().minCallQual;
+        return vc.getPhredScaledQual() >= minCallQual && vc.getAlternateAlleles().stream().anyMatch(a -> !a.isSymbolic() && !a.equals(Allele.SPAN_DEL))
+                && vc.getGenotypes().stream().anyMatch(g -> g.isCalled() && g.getAlleles().stream()
+                        .anyMatch(a -> a.isCalled() && a.isNonReference() && !a.isSymbolic() && !a.equals(Allele.SPAN_DEL)));
+    }
+
+    private static int distanceForTest(final VariantContext a, final VariantContext b) {
+        return a.getEnd() < b.getStart() ? b.getStart() - a.getEnd() : b.getEnd() < a.getStart() ? a.getStart() - b.getEnd() : 0;
+    }
+
+    /**
+     * Checks a rescue run's output against the same run without rescue.
+     *
+     * @return the rescue records
+     */
+    private static List<VariantContext> assertMq0RescueOutput(final File plain, final File rescued, final ReferenceConfidenceMode mode) throws IOException {
+        return assertMq0RescueOutput(plain, rescued, mode, 10);
+    }
+
+    /**
+     * Checks a rescue run's output against the same run without rescue.
+     *
+     * @param minRescue the fewest rescue records expected
+     * @return the rescue records
+     */
+    private static List<VariantContext> assertMq0RescueOutput(final File plain, final File rescued, final ReferenceConfidenceMode mode,
+                                                              final int minRescue) throws IOException {
+        final Pair<VCFHeader, List<VariantContext>> plainVcf = VariantContextTestUtils.readEntireVCFIntoMemory(plain.getAbsolutePath());
+        final Pair<VCFHeader, List<VariantContext>> rescuedVcf = VariantContextTestUtils.readEntireVCFIntoMemory(rescued.getAbsolutePath());
+
+        // the header is the regular one plus the rescue lines
+        final VCFHeader header = rescuedVcf.getLeft();
+        Assert.assertNotNull(header.getFilterHeaderLine(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME));
+        for (final String key : GATKVCFConstants.MQ0_RESCUE_INFO_KEYS) {
+            Assert.assertTrue(header.hasInfoLine(key), key);
+            Assert.assertFalse(plainVcf.getLeft().hasInfoLine(key), key);
+        }
+        Assert.assertEquals(header.getMetaDataInInputOrder().size(), plainVcf.getLeft().getMetaDataInInputOrder().size() + 4);
+
+        final List<VariantContext> records = rescuedVcf.getRight();
+        final List<VariantContext> rescue = records.stream().filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord).collect(Collectors.toList());
+        Assert.assertTrue(rescue.size() >= minRescue, "expected rescue records, got " + rescue.size());
+
+        // Apart from the rescue records, the records are those of the regular output, unchanged (in VCF mode, QD
+        // included, so the rescue draws nothing from the shared random generator), except for the reference records
+        // and the regular non-calls under rescue records, which these replace. GVCF blocks are left out of the
+        // comparison, since rescue records split them.
+        final List<String> plainLines = dataLines(plain);
+        final List<VariantContext> plainRecords = plainVcf.getRight();
+        Assert.assertEquals(plainLines.size(), plainRecords.size());
+        final List<String> expected = new ArrayList<>();
+        for (int i = 0; i < plainLines.size(); i++) {
+            final VariantContext vc = plainRecords.get(i);
+            final boolean block = vc.getAlternateAlleles().equals(List.of(Allele.NON_REF_ALLELE));
+            final boolean replaced = !isCallForTest(vc) && rescue.stream().anyMatch(r -> r.overlaps(vc));
+            if (!replaced && !(mode == ReferenceConfidenceMode.GVCF && block)) {
+                expected.add(plainLines.get(i));
+            }
+        }
+        final List<String> actual = dataLines(rescued).stream()
+                .filter(line -> !line.split("\t", 8)[6].equals(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME))
+                .filter(line -> mode != ReferenceConfidenceMode.GVCF || !line.split("\t", 6)[4].equals(GVCF_BLOCK_ALT))
+                .collect(Collectors.toList());
+        Assert.assertEquals(actual, expected);
+
+        final List<VariantContext> regularCalls = records.stream()
+                .filter(vc -> !isMq0RescueRecord(vc) && isCallForTest(vc)).collect(Collectors.toList());
+        Assert.assertFalse(regularCalls.isEmpty());
+        final SimpleInterval interval = new SimpleInterval(MQ0_RESCUE_INTERVAL);
+        int lastStart = 0;
+        for (final VariantContext vc : records) {
+            Assert.assertTrue(vc.getStart() > lastStart, "out of order or at the same position: " + vc);
+            lastStart = vc.getStart();
+        }
+        final int distance = new Mq0RescueArgumentCollection().distance;
+        for (final VariantContext vc : rescue) {
+            Assert.assertTrue(interval.contains(new SimpleInterval(vc.getContig(), vc.getStart(), vc.getStart())), vc.toString());
+            Assert.assertEquals(vc.getFilters(), Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME), vc.toString());
+            // a call: a non-reference genotype with QUAL at least the minimum, and no '*' allele
+            Assert.assertTrue(isCallForTest(vc), vc.toString());
+            Assert.assertFalse(vc.hasAllele(Allele.SPAN_DEL), vc.toString());
+            // no other record overlaps it
+            Assert.assertTrue(records.stream().noneMatch(other -> other != vc && other.overlaps(vc)), vc + " overlaps another record");
+            // MAPQ-0 reads cover it, but no more than the BAM has; and no more reads with MAPQ above 0 than the BAM has
+            final int mq0Depth = vc.getAttributeAsInt(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY, -1);
+            Assert.assertTrue(mq0Depth > 0 && mq0Depth <= countBamReads(vc.getContig(), vc.getStart(), true), vc.toString());
+            final int depth = vc.getAttributeAsInt(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY, -1);
+            Assert.assertTrue(depth >= 0 && depth <= countBamReads(vc.getContig(), vc.getStart(), false), vc.toString());
+            // no regular call within the rescue distance
+            final int nearest = regularCalls.stream().mapToInt(fp -> distanceForTest(fp, vc)).min().getAsInt();
+            Assert.assertTrue(nearest > distance, vc + " is " + nearest + " bp from a regular call");
+            // a SNP's called alt base is carried by a MAPQ-0 read
+            if (vc.isSNP()) {
+                final Set<String> calledAlts = vc.getGenotype(0).getAlleles().stream().filter(Allele::isNonReference)
+                        .map(Allele::getBaseString).collect(Collectors.toSet());
+                Assert.assertTrue(calledAlts.stream().anyMatch(alt -> mq0BasesAt(vc.getContig(), vc.getStart()).contains(alt.charAt(0))), vc.toString());
+            }
+        }
+        return rescue;
+    }
+
+    /** @return the bases MAPQ-0 reads (primary, not duplicates) carry at a position */
+    private static Set<Character> mq0BasesAt(final String contig, final int pos) {
+        final Set<Character> bases = new HashSet<>();
+        try (final ReadsDataSource reads = new ReadsPathDataSource(IOUtils.getPath(NA12878_20_21_WGS_bam))) {
+            for (final Iterator<GATKRead> it = reads.query(new SimpleInterval(contig, pos, pos)); it.hasNext(); ) {
+                final GATKRead r = it.next();
+                if (r.getMappingQuality() == 0 && !r.isSecondaryAlignment() && !r.isDuplicate()) {
+                    final int offset = ReadUtils.getReadIndexForReferenceCoordinate(r, pos).getLeft();
+                    if (offset >= 0 && offset < r.getLength()) {
+                        bases.add((char) r.getBase(offset));
+                    }
+                }
+            }
+        }
+        return bases;
+    }
+
+    /**
+     * The rescue records of GVCF and VCF output differ only as Mq0RescueArgumentCollection documents. A GVCF rescue
+     * record with QUAL at least the calling threshold is in the VCF, with the same genotype but for phasing (the GVCF
+     * record may list more alleles), and one below it is not,
+     * since VCF mode does not make such calls. Each VCF rescue record the GVCF lacks is explained by a regular GVCF
+     * record the VCF does not hold (a non-call record, or a call below the threshold) that overlaps it or, for a call,
+     * lies within the rescue distance of it.
+     */
+    @Test
+    public void testMq0RescueSitesInVcfAndGvcfModes() {
+        // the calling threshold --dragen-mode sets
+        final double threshold = Double.parseDouble(dragenModeValue(GenotypeCalculationArgumentCollection.CALL_CONFIDENCE_LONG_NAME));
+        final int distance = new Mq0RescueArgumentCollection().distance;
+        final List<VariantContext> gvcfRecords = VariantContextTestUtils.streamVcf(mq0RescueRun(ReferenceConfidenceMode.GVCF, true)).collect(Collectors.toList());
+        final List<VariantContext> vcfRecords = VariantContextTestUtils.streamVcf(mq0RescueRun(ReferenceConfidenceMode.NONE, true)).collect(Collectors.toList());
+        final Map<Integer, VariantContext> gvcf = gvcfRecords.stream().filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord)
+                .collect(Collectors.toMap(VariantContext::getStart, vc -> vc));
+        final Map<Integer, VariantContext> vcf = vcfRecords.stream().filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord)
+                .collect(Collectors.toMap(VariantContext::getStart, vc -> vc));
+        for (final VariantContext vc : gvcf.values()) {
+            final VariantContext inVcf = vcf.get(vc.getStart());
+            if (vc.getPhredScaledQual() >= threshold) {
+                Assert.assertNotNull(inVcf, vc.toString());
+                Assert.assertTrue(inVcf.getGenotype(0).sameGenotype(vc.getGenotype(0), true), vc + " " + inVcf);
+            } else {
+                Assert.assertNull(inVcf, vc.toString());
+            }
+        }
+        final Set<Integer> vcfRegularStarts = vcfRecords.stream().filter(vc -> !isMq0RescueRecord(vc)).map(VariantContext::getStart).collect(Collectors.toSet());
+        final List<VariantContext> gvcfOnlyRegular = gvcfRecords.stream()
+                .filter(vc -> !isMq0RescueRecord(vc) && !vc.getAlternateAlleles().equals(List.of(Allele.NON_REF_ALLELE)) && !vcfRegularStarts.contains(vc.getStart()))
+                .collect(Collectors.toList());
+        final List<VariantContext> vcfOnly = vcf.values().stream().filter(vc -> !gvcf.containsKey(vc.getStart())).collect(Collectors.toList());
+        Assert.assertFalse(vcf.isEmpty());
+        for (final VariantContext vc : vcfOnly) {
+            Assert.assertTrue(gvcfOnlyRegular.stream().anyMatch(regular -> regular.overlaps(vc) || (isCallForTest(regular) && distanceForTest(regular, vc) <= distance)),
+                    vc + " is not explained by a GVCF-only regular record");
+        }
+    }
+
+    /**
+     * Records force-called from --alleles win over rescue records: no rescue record overlaps a given allele, whatever
+     * the genotype of the record force-called there. A filtered --alleles record, which is not force-called without
+     * --force-call-filtered-alleles, does not keep a rescue record out.
+     */
+    @Test
+    public void testMq0RescueGivenAlleles() throws IOException {
+        // given alleles at sites the rescue calls: at two of them an alt base other than the rescued one, which is
+        // force-called 0/0, at the third the rescued alt itself, and at the fourth the rescued alt, filtered
+        final List<VariantContext> rescuedSnps = VariantContextTestUtils.streamVcf(mq0RescueRun(ReferenceConfidenceMode.GVCF, true))
+                .filter(vc -> isMq0RescueRecord(vc) && vc.getReference().length() == 1
+                        && vc.getAlternateAlleles().stream().filter(a -> !a.isSymbolic()).allMatch(a -> a.length() == 1))
+                .limit(4).collect(Collectors.toList());
+        Assert.assertEquals(rescuedSnps.size(), 4);
+        final File given = createTempFile("mq0Rescue.given", ".vcf");
+        final VCFHeader givenHeader = new VCFHeader();
+        try (final ReferenceDataSource reference = ReferenceDataSource.of(IOUtils.getPath(b37_reference_20_21))) {
+            givenHeader.setSequenceDictionary(reference.getSequenceDictionary());
+        }
+        givenHeader.addMetaDataLine(new VCFFilterHeaderLine("given", "a filtered given allele"));
+        try (final VariantContextWriter writer = GATKVariantContextUtils.createVCFWriter(given.toPath(), givenHeader.getSequenceDictionary(), false, Options.INDEX_ON_THE_FLY)) {
+            writer.writeHeader(givenHeader);
+            for (int i = 0; i < rescuedSnps.size(); i++) {
+                final VariantContext vc = rescuedSnps.get(i);
+                final Allele rescuedAlt = vc.getAlternateAllele(0);
+                final Allele alt = i >= 2 ? rescuedAlt : Allele.create(List.of("A", "C", "G", "T").stream()
+                        .filter(b -> !b.equals(vc.getReference().getBaseString()) && vc.getAlleles().stream().noneMatch(a -> a.getBaseString().equals(b)))
+                        .findFirst().get());
+                final VariantContextBuilder builder = new VariantContextBuilder("given", vc.getContig(), vc.getStart(), vc.getStart(), List.of(vc.getReference(), alt));
+                writer.add((i == 3 ? builder.filter("given") : builder.passFilters()).make());
+            }
+        }
+        final File output = createTempFile("mq0Rescue.givenAlleles", ".g.vcf");
+        runCommandLine(mq0RescueArgs(output, ReferenceConfidenceMode.GVCF).addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME)
+                .add(AssemblyBasedCallerArgumentCollection.FORCE_CALL_ALLELES_LONG_NAME, given));
+        final List<VariantContext> records = VariantContextTestUtils.streamVcf(output).collect(Collectors.toList());
+        Assert.assertTrue(records.stream().filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord).count() >= 10);
+        Assert.assertTrue(records.stream().anyMatch(r -> isMq0RescueRecord(r) && r.getStart() == rescuedSnps.get(3).getStart()), "filtered given allele");
+        for (final VariantContext vc : rescuedSnps.subList(0, 3)) {
+            final List<VariantContext> atSite = records.stream().filter(r -> r.overlaps(vc)).collect(Collectors.toList());
+            Assert.assertTrue(atSite.stream().noneMatch(HaplotypeCallerIntegrationTest::isMq0RescueRecord), atSite.toString());
+            Assert.assertTrue(atSite.stream().anyMatch(r -> r.getStart() == vc.getStart() && !r.getAlternateAlleles().equals(List.of(Allele.NON_REF_ALLELE))),
+                    "no force-called record at " + vc.getStart() + ": " + atSite);
+        }
+    }
+
+    /**
+     * The rescue draws its random numbers from its own generators: with --max-reads-per-alignment-start low enough that
+     * the read stream and the rescue both downsample at random, the regular records are the same as without rescue.
+     */
+    @Test
+    public void testMq0RescueRandomIsolation() throws IOException {
+        final Map<Boolean, File> outputs = new HashMap<>();
+        for (final boolean rescue : new boolean[]{false, true}) {
+            outputs.put(rescue, createTempFile("mq0Rescue.random." + rescue, ".vcf"));
+            final ArgumentsBuilder args = mq0RescueArgs(outputs.get(rescue), ReferenceConfidenceMode.NONE)
+                    .add(AssemblyRegionArgumentCollection.MAX_STARTS_LONG_NAME, 2);
+            if (rescue) {
+                args.addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+            }
+            Utils.resetRandomGenerator();
+            runCommandLine(args);
+        }
+        // the regular records are the same, but for the non-call records rescue records replace
+        assertMq0RescueOutput(outputs.get(false), outputs.get(true), ReferenceConfidenceMode.NONE, 1);
+    }
+
+    /**
+     * The rescue works with the options that change how regions are called: --pileup-detection, --max-mnp-distance,
+     * and --dragen-378-concordance-mode in place of --dragen-mode.
+     */
+    @DataProvider
+    public Object[][] mq0RescueOptions() {
+        return new Object[][]{
+                {List.of("--" + HaplotypeCallerArgumentCollection.DRAGEN_378_GATK_MODE_LONG_NAME), 1},
+                {List.of("--" + PileupDetectionArgumentCollection.PILEUP_DETECTION_LONG_NAME), 1},
+                {List.of("--" + AssemblyBasedCallerArgumentCollection.MAX_MNP_DISTANCE_LONG_NAME, "2"), 1}};
+    }
+
+    @Test(dataProvider = "mq0RescueOptions")
+    public void testMq0RescueWithOptions(final List<String> options, final int minRescue) throws IOException {
+        // --dragen-378-concordance-mode takes the place of --dragen-mode, in VCF mode: in GVCF mode its regular calls
+        // fail on this interval without the rescue too
+        final boolean dragen378 = options.contains("--" + HaplotypeCallerArgumentCollection.DRAGEN_378_GATK_MODE_LONG_NAME);
+        final ReferenceConfidenceMode mode = dragen378 ? ReferenceConfidenceMode.NONE : ReferenceConfidenceMode.GVCF;
+        final Map<Boolean, File> outputs = new HashMap<>();
+        for (final boolean rescue : new boolean[]{false, true}) {
+            outputs.put(rescue, createTempFile("mq0Rescue.options." + rescue, dragen378 ? ".vcf" : ".g.vcf"));
+            final ArgumentsBuilder args = dragen378 ? mq0RescueArgsWithoutDragen(outputs.get(rescue), mode, "21:10000000-10005000") :
+                    mq0RescueArgs(outputs.get(rescue), mode, "21:10000000-10005000");
+            options.forEach(args::addRaw);
+            if (rescue) {
+                args.addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+            }
+            runCommandLine(args);
+        }
+        assertMq0RescueOutput(outputs.get(false), outputs.get(true), mode, minRescue);
+    }
+
+    /**
+     * A rescue record at the last position of the run, decided after the last region (here, the only one).
+     */
+    @Test(dataProvider = "mq0RescueModes")
+    public void testMq0RescueAtLastPosition(final ReferenceConfidenceMode mode) {
+        final File output = createTempFile("mq0Rescue.lastPosition", ".vcf");
+        runCommandLine(mq0RescueArgs(output, mode, "21:10017000-10017628").addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME));
+        final List<VariantContext> records = VariantContextTestUtils.streamVcf(output).collect(Collectors.toList());
+        final VariantContext last = records.get(records.size() - 1);
+        Assert.assertTrue(isMq0RescueRecord(last) && last.getStart() == 10017628, last.toString());
+    }
+
+    @Test(expectedExceptions = UserException.class, expectedExceptionsMessageRegExp = ".*cannot be used with --population-callset.*")
+    public void testMq0RescueRejectsPopulationCallset() {
+        runCommandLine(mq0RescueArgs(createTempFile("mq0Rescue", ".g.vcf"), ReferenceConfidenceMode.GVCF)
+                .addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME)
+                .add(GenotypeCalculationArgumentCollection.SUPPORTING_CALLSET_LONG_NAME, largeFileTestDir + "1000G.phase3.broad.withGenotypes.chr20.10100000.vcf"));
+    }
+
+    /**
+     * The rescue writes nothing to the side outputs: the bamout, the assembled-variants output, the haplotype
+     * histogram, the assembly regions and the genotyper debug output are the same as without rescue. (The assembly
+     * graph output names vertices by object identity, so it differs from run to run; INJECT-mode rescue calls do not
+     * assemble.)
+     */
+    @Test
+    public void testMq0RescueSideOutputs() throws IOException {
+        final List<String> textOutputs = List.of(ReadThreadingAssemblerArgumentCollection.DEBUG_ASSEMBLY_VARIANTS_OUT_LONG_NAME,
+                ReadThreadingAssemblerArgumentCollection.HAPLOTYPE_DEBUG_HISTOGRAM_OUTPUT_LONG_NAME,
+                AssemblyRegionArgumentCollection.ASSEMBLY_REGION_OUT_LONG_NAME, HaplotypeCallerArgumentCollection.DEBUG_GENOTYPER_OUTPUT_LONG_NAME);
+        final Map<Boolean, File> bams = new HashMap<>();
+        final Map<Boolean, Map<String, File>> texts = new HashMap<>();
+        for (final boolean rescue : new boolean[]{false, true}) {
+            bams.put(rescue, createTempFile("mq0Rescue.bamout." + rescue, ".bam"));
+            final ArgumentsBuilder args = mq0RescueArgs(createTempFile("mq0Rescue.side." + rescue, ".g.vcf"), ReferenceConfidenceMode.GVCF, "21:10000000-10005000")
+                    .add(AssemblyBasedCallerArgumentCollection.BAM_OUTPUT_LONG_NAME, bams.get(rescue));
+            final Map<String, File> files = new LinkedHashMap<>();
+            for (final String name : textOutputs) {
+                files.put(name, createTempFile("mq0Rescue." + name + "." + rescue, name.equals(ReadThreadingAssemblerArgumentCollection.DEBUG_ASSEMBLY_VARIANTS_OUT_LONG_NAME) ? ".vcf" : ".txt"));
+                args.add(name, files.get(name));
+            }
+            texts.put(rescue, files);
+            if (rescue) {
+                args.addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+            }
+            runCommandLine(args);
+        }
+        for (final String name : textOutputs) {
+            final List<String> withRescue = Files.readAllLines(texts.get(true).get(name).toPath());
+            Assert.assertFalse(withRescue.isEmpty(), name);
+            Assert.assertEquals(withRescue, Files.readAllLines(texts.get(false).get(name).toPath()), name);
+        }
+        final List<String> withRescue = samRecords(bams.get(true));
+        Assert.assertFalse(withRescue.isEmpty());
+        Assert.assertEquals(withRescue, samRecords(bams.get(false)));
+    }
+
+    private static List<String> samRecords(final File bam) {
+        try (final ReadsDataSource reads = new ReadsPathDataSource(bam.toPath())) {
+            return StreamSupport.stream(reads.spliterator(), false).map(r -> r.convertToSAMRecord(reads.getHeader()).getSAMString())
+                    .collect(Collectors.toList());
+        }
+    }
+
+    /**
+     * With --sample-name on a multi-sample input, the rescue uses only that sample's reads, MAPQ-0 and regular: its depths
+     * are those of a run that filters the other samples' reads out.
+     */
+    @Test
+    public void testMq0RescueSampleName() {
+        final String bam = largeFileTestDir + "multiSampleSubsetted.bam";
+        final File sampleName = createTempFile("mq0Rescue.sampleName", ".vcf");
+        runCommandLine(new ArgumentsBuilder().addInput(bam).addReference(hg38Reference).addInterval("chr1:1590000-1600000")
+                .addFlag(HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME)
+                .addOutput(sampleName).add("sample-name", "NA12878").addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME)
+                .add(StandardArgumentDefinitions.ADD_OUTPUT_VCF_COMMANDLINE, false));
+        final File filtered = createTempFile("mq0Rescue.sampleFilter", ".vcf");
+        runCommandLine(new ArgumentsBuilder().addInput(bam).addReference(hg38Reference).addInterval("chr1:1590000-1600000")
+                .addFlag(HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME)
+                .addOutput(filtered).add("read-filter", "SampleReadFilter").add("sample", "NA12878")
+                .addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME).add(StandardArgumentDefinitions.ADD_OUTPUT_VCF_COMMANDLINE, false));
+        final Map<Integer, VariantContext> expected = VariantContextTestUtils.streamVcf(filtered)
+                .filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord).collect(Collectors.toMap(VariantContext::getStart, vc -> vc));
+        final List<VariantContext> actual = VariantContextTestUtils.streamVcf(sampleName).filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord)
+                .filter(vc -> expected.containsKey(vc.getStart())).collect(Collectors.toList());
+        Assert.assertFalse(actual.isEmpty());
+        for (final VariantContext vc : actual) {
+            for (final String key : List.of(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY, GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY)) {
+                Assert.assertEquals(vc.getAttributeAsInt(key, -1), expected.get(vc.getStart()).getAttributeAsInt(key, -2), vc.toString());
+            }
+        }
+    }
+
+    /**
+     * Known rescue calls: heterozygous SNPs where MAPQ-0 reads (MQ0R_DP0) make up a good part of the depth next to the
+     * reads with MAPQ above 0 (MQ0R_DP1).
+     */
+    @Test
+    public void testMq0RescueCalls() {
+        final Map<Integer, VariantContext> rescue = VariantContextTestUtils.streamVcf(mq0RescueRun(ReferenceConfidenceMode.GVCF, true))
+                .filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord)
+                .collect(Collectors.toMap(VariantContext::getStart, vc -> vc));
+        // position, called alt, minimum QUAL, MQ0R_DP1, MQ0R_DP0
+        final Object[][] expected = {
+                {10003018, "G", 25.0, 37, 29},
+                {10005921, "T", 25.0, 66, 162},
+                {10007597, "G", 25.0, 65, 41},
+                {10011449, "T", 15.0, 33, 26}};
+        for (final Object[] e : expected) {
+            final VariantContext vc = rescue.get((Integer) e[0]);
+            Assert.assertNotNull(vc, "no rescue record at " + e[0]);
+            final Genotype g = vc.getGenotype(0);
+            Assert.assertTrue(g.isHet(), vc.toString());
+            Assert.assertTrue(g.getAlleles().stream().anyMatch(a -> a.getBaseString().equals(e[1])), vc.toString());
+            Assert.assertTrue(vc.getPhredScaledQual() >= (Double) e[2], vc.toString());
+            Assert.assertEquals(vc.getAttributeAsInt(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY, -1), e[3], vc.toString());
+            Assert.assertEquals(vc.getAttributeAsInt(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY, -1), e[4], vc.toString());
+        }
+    }
+
+    /**
+     * The rescue genotyping does not cap base qualities at MAPQ even if the cap that --dragen-mode turns off is turned
+     * back on: without that, every MAPQ-0 base would score at the minimum base quality. The rescue records the two runs
+     * share have the same QUAL (the capped regular calls differ, so the runs can rescue different sites).
+     */
+    @Test
+    public void testMq0RescueKeepsBaseQualitiesUncapped() {
+        final File capped = createTempFile("mq0Rescue.capped", ".g.vcf");
+        runCommandLine(mq0RescueArgs(capped, ReferenceConfidenceMode.GVCF).addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME)
+                .add(LikelihoodEngineArgumentCollection.DISABLE_CAP_BASE_QUALITIES_TO_MAP_QUALITY_LONG_NAME, false));
+        final Map<Integer, VariantContext> uncapped = VariantContextTestUtils.streamVcf(mq0RescueRun(ReferenceConfidenceMode.GVCF, true))
+                .filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord).collect(Collectors.toMap(VariantContext::getStart, vc -> vc));
+        final List<VariantContext> shared = VariantContextTestUtils.streamVcf(capped).filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord)
+                .filter(vc -> uncapped.containsKey(vc.getStart())).collect(Collectors.toList());
+        Assert.assertTrue(shared.size() >= 10, shared.size() + " shared rescue records");
+        shared.forEach(vc -> Assert.assertEquals(vc.getPhredScaledQual(), uncapped.get(vc.getStart()).getPhredScaledQual(), 0.01, vc.toString()));
+    }
+
+    /**
+     * With --ploidy-regions, rescue calls use the region's ploidy; with several intervals on two contigs (rescue records on
+     * the second only, as the test BAM's MAPQ-0 reads on 20 make no DRAGEN-mode rescue call), the records of both come out
+     * in order; and the same run gives the same output twice.
+     */
+    @Test
+    public void testMq0RescuePloidyContigsAndDeterminism() throws IOException {
+        final File ploidyBed = createTempFile("mq0Rescue.ploidy", ".bed");
+        Files.writeString(ploidyBed.toPath(), "21\t9999999\t10020000\t1\n");
+        final File haploid = createTempFile("mq0Rescue.haploid", ".g.vcf");
+        runCommandLine(mq0RescueArgs(haploid, ReferenceConfidenceMode.GVCF).addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME)
+                .add(HaplotypeCallerArgumentCollection.PLOIDY_REGIONS_NAME, ploidyBed));
+        final List<VariantContext> haploidRescue = VariantContextTestUtils.streamVcf(haploid)
+                .filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord).collect(Collectors.toList());
+        Assert.assertFalse(haploidRescue.isEmpty());
+        haploidRescue.forEach(vc -> Assert.assertEquals(vc.getGenotype(0).getPloidy(), 1, vc.toString()));
+
+        final File twoContigs = createTempFile("mq0Rescue.twoContigs", ".g.vcf");
+        runCommandLine(mq0RescueArgs(twoContigs, ReferenceConfidenceMode.GVCF, "20:10130000-10150000", "21:10000000-10005000")
+                .addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME));
+        final List<VariantContext> records = VariantContextTestUtils.streamVcf(twoContigs).collect(Collectors.toList());
+        final List<String> rescueContigs = records.stream().filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord)
+                .map(VariantContext::getContig).distinct().collect(Collectors.toList());
+        Assert.assertEquals(rescueContigs, List.of("21"));
+        Assert.assertEquals(records.stream().map(VariantContext::getContig).distinct().collect(Collectors.toList()), List.of("20", "21"));
+        for (int i = 1; i < records.size(); i++) {
+            final VariantContext a = records.get(i - 1);
+            final VariantContext b = records.get(i);
+            Assert.assertTrue(Integer.parseInt(a.getContig()) < Integer.parseInt(b.getContig())
+                    || (a.getContig().equals(b.getContig()) && a.getStart() < b.getStart()), b.toString());
+        }
+
+        final File again = createTempFile("mq0Rescue.again", ".g.vcf");
+        runCommandLine(mq0RescueArgs(again, ReferenceConfidenceMode.GVCF).addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME));
+        IntegrationTestSpec.assertEqualTextFiles(again, mq0RescueRun(ReferenceConfidenceMode.GVCF, true));
+    }
+
+    /**
+     * The rescue GVCF is valid as a GVCF and is accepted by the GVCF tools downstream.
+     */
+    @Test
+    public void testMq0RescueGvcfIsValid() {
+        final File gvcf = mq0RescueRun(ReferenceConfidenceMode.GVCF, true);
+        runCommandLine(new ArgumentsBuilder().addReference(b37_reference_20_21).addVCF(gvcf).addInterval(MQ0_RESCUE_INTERVAL)
+                .addFlag(ValidateVariants.GVCF_VALIDATE), ValidateVariants.class.getSimpleName());
+        final File genotyped = createTempFile("mq0Rescue.genotyped", ".vcf");
+        runCommandLine(new ArgumentsBuilder().addReference(b37_reference_20_21).addVCF(gvcf).addOutput(genotyped),
+                GenotypeGVCFs.class.getSimpleName());
+        final File combined = createTempFile("mq0Rescue.combined", ".g.vcf");
+        runCommandLine(new ArgumentsBuilder().addReference(b37_reference_20_21).addVCF(gvcf).addVCF(mq0RescueRun(ReferenceConfidenceMode.GVCF, false))
+                .addOutput(combined), CombineGVCFs.class.getSimpleName());
+        final File reblocked = createTempFile("mq0Rescue.reblocked", ".g.vcf");
+        runCommandLine(new ArgumentsBuilder().addReference(b37_reference_20_21).addVCF(gvcf).addOutput(reblocked),
+                ReblockGVCF.class.getSimpleName());
+        // The rescue calls come out of joint genotyping as calls. GenotypeGVCFs drops their FILTER and MQ0R flag but
+        // keeps the depths MQ0R_DP0 and MQ0R_DP1, the markers left.
+        final List<VariantContext> rescue = VariantContextTestUtils.readEntireVCFIntoMemory(gvcf.getAbsolutePath()).getRight().stream()
+                .filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord).collect(Collectors.toList());
+        final Map<Integer, VariantContext> genotypedByStart = VariantContextTestUtils.streamVcf(genotyped)
+                .collect(Collectors.toMap(VariantContext::getStart, vc -> vc, (a, b) -> a));
+        final List<VariantContext> genotypedRescue = rescue.stream().map(vc -> genotypedByStart.get(vc.getStart()))
+                .filter(Objects::nonNull).collect(Collectors.toList());
+        Assert.assertFalse(genotypedRescue.isEmpty());
+        genotypedRescue.forEach(vc -> {
+            Assert.assertTrue(vc.hasAttribute(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY) && vc.hasAttribute(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY), vc.toString());
+            Assert.assertFalse(vc.hasAttribute(GATKVCFConstants.MQ0_RESCUE_KEY), vc.toString());
+            Assert.assertFalse(vc.isFiltered(), vc.toString());
+        });
+        // CombineGVCFs keeps the depths too, and drops the FILTER and the flag
+        final Map<Integer, VariantContext> combinedByStart = VariantContextTestUtils.streamVcf(combined)
+                .collect(Collectors.toMap(VariantContext::getStart, vc -> vc, (a, b) -> a));
+        rescue.forEach(r -> {
+            final VariantContext vc = combinedByStart.get(r.getStart());
+            Assert.assertNotNull(vc, r.toString());
+            Assert.assertTrue(vc.hasAttribute(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY) && vc.hasAttribute(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY), vc.toString());
+            Assert.assertFalse(vc.hasAttribute(GATKVCFConstants.MQ0_RESCUE_KEY), vc.toString());
+            Assert.assertFalse(vc.isFiltered(), vc.toString());
+        });
+    }
+
+    /** The rescue is validated only in DRAGEN mode, so it requires --dragen-mode (or --dragen-378-concordance-mode). */
+    @Test(expectedExceptions = UserException.class, expectedExceptionsMessageRegExp = ".*mq0-rescue is validated only in DRAGEN mode and requires --dragen-mode.*")
+    public void testMq0RescueRequiresDragenMode() {
+        runCommandLine(mq0RescueArgsWithoutDragen(createTempFile("mq0Rescue", ".g.vcf"), ReferenceConfidenceMode.GVCF)
+                .addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME));
+    }
+
+    /** Without --mq0-rescue, HaplotypeCaller runs without --dragen-mode as before, warning about rescue-only arguments. */
+    @Test
+    public void testMq0RescueArgumentsWithoutRescueOrDragen() {
+        runCommandLine(mq0RescueArgsWithoutDragen(createTempFile("mq0Rescue.off", ".vcf"), ReferenceConfidenceMode.NONE, "21:10000000-10001000")
+                .add(Mq0RescueArgumentCollection.MQ0_RESCUE_DISTANCE_LONG_NAME, 20));
+    }
+
+    @Test(expectedExceptions = UserException.class, expectedExceptionsMessageRegExp = ".*not supported by RampedHaplotypeCaller.*")
+    public void testMq0RescueRejectedByRampedHaplotypeCaller() {
+        runCommandLine(mq0RescueArgs(createTempFile("mq0Rescue", ".g.vcf"), ReferenceConfidenceMode.GVCF)
+                .addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME), RampedHaplotypeCaller.class.getSimpleName());
+    }
+
+    @Test(expectedExceptions = CommandLineException.class)
+    public void testMq0RescueNotAnArgumentOfHaplotypeCallerSpark() {
+        runCommandLine(mq0RescueArgs(createTempFile("mq0Rescue", ".g.vcf"), ReferenceConfidenceMode.GVCF)
+                .addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME), HaplotypeCallerSpark.class.getSimpleName());
     }
 }

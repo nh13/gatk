@@ -5,6 +5,7 @@ import htsjdk.samtools.SAMSequenceDictionary;
 import htsjdk.variant.variantcontext.writer.VariantContextWriter;
 import org.broadinstitute.barclay.argparser.Argument;
 import org.broadinstitute.barclay.argparser.ArgumentCollection;
+import org.broadinstitute.barclay.argparser.CommandLineArgumentParser;
 import org.broadinstitute.barclay.argparser.CommandLineProgramProperties;
 import org.broadinstitute.barclay.help.DocumentedFeature;
 import org.broadinstitute.hellbender.cmdline.GATKPlugin.GATKReadFilterPluginDescriptor;
@@ -13,20 +14,25 @@ import org.broadinstitute.hellbender.cmdline.StandardArgumentDefinitions;
 import org.broadinstitute.hellbender.cmdline.argumentcollections.ReferenceInputArgumentCollection;
 import org.broadinstitute.hellbender.cmdline.programgroups.ShortVariantDiscoveryProgramGroup;
 import org.broadinstitute.hellbender.engine.*;
+import org.broadinstitute.hellbender.engine.filters.CountingReadFilter;
 import org.broadinstitute.hellbender.engine.filters.MappingQualityReadFilter;
 import org.broadinstitute.hellbender.engine.filters.ReadFilter;
+import org.broadinstitute.hellbender.engine.filters.ReadFilterLibrary;
 import org.broadinstitute.hellbender.engine.spark.AssemblyRegionArgumentCollection;
 import org.broadinstitute.hellbender.exceptions.UserException;
 import org.broadinstitute.hellbender.tools.walkers.annotator.Annotation;
 import org.broadinstitute.hellbender.tools.walkers.annotator.HaplotypeFilteringAnnotation;
 import org.broadinstitute.hellbender.tools.walkers.annotator.VariantAnnotatorEngine;
+import org.broadinstitute.hellbender.tools.walkers.genotyper.GenotypeCalculationArgumentCollection;
 import org.broadinstitute.hellbender.transformers.DRAGENMappingQualityReadTransformer;
 import org.broadinstitute.hellbender.transformers.ReadTransformer;
 import org.broadinstitute.hellbender.utils.fasta.CachingIndexedFastaSequenceFile;
+import org.broadinstitute.hellbender.utils.read.GATKRead;
 
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 
 /**
@@ -163,6 +169,15 @@ public class HaplotypeCaller extends AssemblyRegionWalker {
     @ArgumentCollection
     private HaplotypeCallerArgumentCollection hcArgs = new HaplotypeCallerArgumentCollection();
 
+    @ArgumentCollection
+    private Mq0RescueArgumentCollection mq0RescueArgs = new Mq0RescueArgumentCollection();
+
+    {
+        // The engine reads the rescue settings from hcArgs; the parser fills in this same object, so the tool and the
+        // engine share one copy of them from the start.
+        hcArgs.mq0RescueArgs = mq0RescueArgs;
+    }
+
     /**
      * A raw, unfiltered, highly sensitive callset in VCF format.
      */
@@ -199,6 +214,7 @@ public class HaplotypeCaller extends AssemblyRegionWalker {
                     hcArgs.dragen378Mode? hcArgs.getDragenVersion378NameValuePairs() : hcArgs.getDragenVersion3412NameValuePairs(),
                     hcArgs.dragen378Mode? HaplotypeCallerArgumentCollection.DRAGEN_378_GATK_MODE_LONG_NAME : HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME);
         }
+        validateMq0RescueArguments();
         if (hcArgs.isFlowBasedCallingMode()) {
             ModeArgumentUtils.setArgValues(
                     getCommandLineParser(),
@@ -211,6 +227,91 @@ public class HaplotypeCaller extends AssemblyRegionWalker {
 
     @Override
     public ReadTransformer makePreReadFilterTransformer() { return HaplotypeCallerEngine.makeStandardHCReadTransformer(); }
+
+    /**
+     * Checks the MAPQ-0 rescue arguments against each other and against the rest of the command line.
+     */
+    private void validateMq0RescueArguments() {
+        final List<String> givenRescueOnlyArguments = Mq0RescueArgumentCollection.givenRescueOnlyArguments((CommandLineArgumentParser) getCommandLineParser());
+        if (!mq0RescueArgs.enabled && !givenRescueOnlyArguments.isEmpty()) {
+            logger.warn("Ignoring " + givenRescueOnlyArguments.stream().map(name -> "--" + name).collect(Collectors.joining(", ")) +
+                    ", which only apply with --" + Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+        }
+        // The rescue has been validated in DRAGEN mode only, where base qualities are not capped at MAPQ, the genotyping
+        // mapping-quality threshold is 1 and the calling threshold is the rescue's minimum QUAL (3), so its calls are
+        // scored like the regular ones next to them.
+        if (mq0RescueArgs.enabled && !hcArgs.isDragenGATKMode()) {
+            throw new UserException("--" + Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME + " is validated only in DRAGEN mode and requires --" +
+                    HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME + " (or --" + HaplotypeCallerArgumentCollection.DRAGEN_378_GATK_MODE_LONG_NAME +
+                    "). Add --" + HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME + ", or remove --" + Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+        }
+        // The regular path applies the population priors to GVCF records inside ReferenceConfidenceModel; rather than
+        // write rescue records without them next to regular records with them, the combination is not allowed.
+        if (mq0RescueArgs.enabled && hcArgs.standardArgs.genotypeArgs.supportVariants != null) {
+            throw new UserException("--" + Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME + " cannot be used with --" +
+                    GenotypeCalculationArgumentCollection.SUPPORTING_CALLSET_LONG_NAME + ", whose priors the rescue records would not get. " +
+                    "Run without one of them, or apply the priors to the output afterwards with CalculateGenotypePosteriors");
+        }
+    }
+
+    /**
+     * @return whether --mq0-rescue is given
+     */
+    boolean isMq0RescueRequested() {
+        return hcArgs.mq0RescueArgs.enabled;
+    }
+
+    // whether the warning that MAPQ-0 reads pass the read filters was logged, so that it is logged once
+    private boolean warnedMq0ReadsPass = false;
+
+    /**
+     * Without --mq0-rescue this is the tool's usual read filter. With it, the usual filter still decides which reads
+     * reach the regular calling path, so that path is unchanged, but reads it rejects because of the mapping-quality
+     * filters alone (MappingQualityReadFilter and MappingQualityNotZeroReadFilter), whose MAPQ is 0 and that the
+     * engine can use (see {@link HaplotypeCallerEngine#acceptsMq0Read}) are handed to the engine for the rescue step.
+     * The other read filters are checked before the engine's check, so that it sees only well-formed reads. The reads
+     * then go through the post-filter transformer like any other read, but not through the downsampler (the engine
+     * caps them per alignment start itself).
+     */
+    @Override
+    public CountingReadFilter makeReadFilter() {
+        final CountingReadFilter mainFilter = super.makeReadFilter();
+        if (!isMq0RescueRequested() || !hasReads()) {
+            return mainFilter;
+        }
+        final GATKReadFilterPluginDescriptor readFilterPlugin =
+                getCommandLineParser().getPluginDescriptor(GATKReadFilterPluginDescriptor.class);
+        if (readFilterPlugin.getResolvedInstances().stream().noneMatch(rf -> rf instanceof ReadFilterLibrary.MappingQualityNotZeroReadFilter
+                || (rf instanceof MappingQualityReadFilter mq && mq.minMappingQualityScore > 0)) && !warnedMq0ReadsPass) {
+            warnedMq0ReadsPass = true;
+            logger.warn("MAPQ-0 reads pass the read filters, so none is set aside for the rescue and --" +
+                    Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME + " has no effect");
+        }
+        final List<ReadFilter> otherFilters = readFilterPlugin.getResolvedInstances().stream()
+                .filter(rf -> !(rf instanceof MappingQualityReadFilter) && !(rf instanceof ReadFilterLibrary.MappingQualityNotZeroReadFilter))
+                .collect(Collectors.toList());
+        final ReadFilter otherFilter = ReadFilter.fromList(otherFilters, getHeaderForReads());
+        final ReadTransformer postTransformer = makePostReadFilterTransformer();
+        return new CountingReadFilter(mainFilter) {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public boolean test(final GATKRead read) {
+                if (mainFilter.test(read)) {
+                    return true;
+                }
+                if (read.getMappingQuality() == 0 && otherFilter.test(read) && hcEngine.acceptsMq0Read(read)) {
+                    hcEngine.addMq0Read(postTransformer.apply(read));
+                }
+                return false;
+            }
+
+            @Override
+            public String getSummaryLine() {
+                return mainFilter.getSummaryLine();
+            }
+        };
+    }
 
     @Override
     public List<Class<? extends Annotation>> getDefaultVariantAnnotationGroups() { return HaplotypeCallerEngine.getStandardHaplotypeCallerAnnotationGroups();}
@@ -282,6 +383,13 @@ public class HaplotypeCaller extends AssemblyRegionWalker {
     @Override
     public void apply(final AssemblyRegion region, final ReferenceContext referenceContext, final FeatureContext featureContext ) {
         hcEngine.callRegion(region, featureContext, referenceContext).forEach(vcfWriter::add);
+    }
+
+    @Override
+    public Object onTraversalSuccess() {
+        // the records the engine held back to merge MAPQ-0 rescue records among them
+        hcEngine.finishCallingRegions().forEach(vcfWriter::add);
+        return null;
     }
 
     @Override

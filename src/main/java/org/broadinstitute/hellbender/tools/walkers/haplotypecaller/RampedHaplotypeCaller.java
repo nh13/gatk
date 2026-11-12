@@ -5,6 +5,7 @@ import org.broadinstitute.barclay.argparser.*;
 import org.broadinstitute.barclay.help.DocumentedFeature;
 import org.broadinstitute.hellbender.cmdline.programgroups.ShortVariantDiscoveryProgramGroup;
 import org.broadinstitute.hellbender.engine.spark.AssemblyRegionArgumentCollection;
+import org.broadinstitute.hellbender.exceptions.UserException;
 import org.broadinstitute.hellbender.tools.walkers.annotator.VariantAnnotatorEngine;
 import org.broadinstitute.hellbender.tools.walkers.haplotypecaller.ramps.AssemblerOffRamp;
 import org.broadinstitute.hellbender.tools.walkers.haplotypecaller.ramps.PostAssemblerOnRamp;
@@ -64,6 +65,15 @@ public class RampedHaplotypeCaller extends HaplotypeCaller {
 
     @ArgumentCollection
     private RampedHaplotypeCallerArgumentCollection rpArgs = new RampedHaplotypeCallerArgumentCollection();
+
+    @Override
+    protected String[] customCommandLineValidation() {
+        // the ramped engine's callRegion does not run the MAPQ-0 rescue
+        if (isMq0RescueRequested()) {
+            throw new UserException("--" + Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME + " is not supported by RampedHaplotypeCaller; run HaplotypeCaller instead, or remove --" + Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+        }
+        return super.customCommandLineValidation();
+    }
 
     @Override
     public void onTraversalStart() {

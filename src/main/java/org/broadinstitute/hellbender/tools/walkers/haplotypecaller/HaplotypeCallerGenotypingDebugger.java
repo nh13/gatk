@@ -6,6 +6,7 @@ import org.broadinstitute.hellbender.utils.io.IOUtils;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
+import java.util.function.Supplier;
 
 /**
  * A short helper class that manages a singleton debug stream for HaplotypeCaller genotyping information that is useful for debugging.
@@ -33,6 +34,21 @@ public class HaplotypeCallerGenotypingDebugger{
     public static synchronized void println(final String debug) {
         if (genotyperDebugOutStream != null) {
             genotyperDebugOutStream.println(debug);
+        }
+    }
+
+    /**
+     * Runs {@code action} with the debugger disabled, for work whose details should not appear in the debug output
+     * (the MAPQ-0 rescue's second genotyping of a region), and returns its result. The debug stream is process-wide,
+     * so this is not safe while other threads write to it; HaplotypeCaller calls it from its one traversal thread.
+     */
+    static <T> T runDisabled(final Supplier<T> action) {
+        final PrintStream stream = genotyperDebugOutStream;
+        genotyperDebugOutStream = null;
+        try {
+            return action.get();
+        } finally {
+            genotyperDebugOutStream = stream;
         }
     }
 

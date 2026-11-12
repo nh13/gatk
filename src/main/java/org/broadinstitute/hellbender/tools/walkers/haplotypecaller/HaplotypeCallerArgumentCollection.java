@@ -60,6 +60,13 @@ public class HaplotypeCallerArgumentCollection extends AssemblyBasedCallerArgume
     @ArgumentCollection
     public FlowBasedAlignmentArgumentCollection fbargs = new FlowBasedAlignmentArgumentCollection();
 
+    /**
+     * The MAPQ-0 rescue settings. Not a command-line argument collection here: only {@link HaplotypeCaller} runs the
+     * rescue (it feeds the engine the MAPQ-0 reads and calls finishCallingRegions), so it alone exposes these arguments
+     * and sets this field from them. Package-private so that no other tool can turn the rescue on.
+     */
+    Mq0RescueArgumentCollection mq0RescueArgs = new Mq0RescueArgumentCollection();
+
     @Override
     protected int getDefaultMaxMnpDistance() { return 0; }
 
