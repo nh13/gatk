@@ -379,10 +379,36 @@ final class Mq0RescueUtils {
 
         /**
          * @return whether every alternate allele that a called genotype of {@code vc} carries is carried by at least one
-         * of the reads, and there is at least one such allele. Each allele is checked on its own (an MNP base by base),
-         * so a pair of alleles is accepted even if no single read carries both.
+         * of the reads, and there is at least one such allele. Each allele is checked on its own, so a pair of alleles
+         * is accepted even if no single read carries both, and so is each part of an allele that reads carry as several
+         * (see {@link #decompositions}).
          */
         boolean supportsCalledAlleles(final VariantContext vc) {
+            final List<ReadAllele> called = calledAlleles(vc);
+            if (called.isEmpty()) {
+                return false;
+            }
+            for (final ReadAllele allele : called) {
+                if (allele == null || decompositions(allele).stream().noneMatch(parts -> parts.stream().allMatch(a -> a != null && count(a) > 0))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * @return whether a called alternate allele of {@code vc} is a compound allele: reference and alternate alleles
+         * of different lengths that are not a plain indel (see {@link #isCompound})
+         */
+        boolean hasCompoundAllele(final VariantContext vc) {
+            return calledAlleles(vc).stream().anyMatch(a -> a != null && isCompound(a));
+        }
+
+        /**
+         * @return the distinct alternate alleles the called genotypes of {@code vc} carry, as {@link Reference#normalize}
+         * gives them (null for one that is not a plain allele)
+         */
+        private List<ReadAllele> calledAlleles(final VariantContext vc) {
             final Set<Allele> called = new LinkedHashSet<>();
             for (final Genotype g : vc.getGenotypes()) {
                 for (final Allele a : g.getAlleles()) {
@@ -391,34 +417,73 @@ final class Mq0RescueUtils {
                     }
                 }
             }
-            if (called.isEmpty()) {
-                return false;
-            }
-            for (final Allele alt : called) {
-                final ReadAllele allele = reference.normalize(vc.getStart(), vc.getReference(), alt);
-                if (allele == null || substitutions(allele).stream().anyMatch(a -> count(a) == 0)) {
-                    return false;
-                }
-            }
-            return true;
+            return called.stream().map(alt -> reference.normalize(vc.getStart(), vc.getReference(), alt)).collect(Collectors.toList());
         }
 
         /**
-         * @return the single-base substitutions an allele of equal-length reference and alternate alleles (an MNP, as
-         * --max-mnp-distance makes them) is made of, which is how reads carry it; or the allele itself otherwise
+         * The ways reads can carry an allele, each a list of the alleles a read carries for it; the allele is carried if
+         * the reads carry every allele of one of them. A SNP or a plain indel is carried as itself. An MNP (equal-length
+         * reference and alternate alleles longer than one base, as --max-mnp-distance makes them) is carried as its
+         * single-base substitutions. A compound allele (see {@link #isCompound}), as assembly makes them, say CT to G,
+         * is carried as one indel and the substitutions around it: its common leading bases are dropped, and then for
+         * each place an aligner can put the gap between the remaining bases, the bases on either side of the gap are
+         * compared base by base, and the indel is anchored at the base before the gap and left-aligned, as the reads'
+         * indels are. So CT to G is carried as G to C at the first base and a deletion of the T, or as a deletion of
+         * the first base and T to G at the second.
+         *
+         * @return the ways, with null for an indel that does not fit in the reference window
          */
-        private static List<ReadAllele> substitutions(final ReadAllele allele) {
-            if (allele.ref().length() != allele.alt().length() || allele.ref().length() == 1) {
-                return List.of(allele);
+        private List<List<ReadAllele>> decompositions(final ReadAllele allele) {
+            if (allele.ref().length() == allele.alt().length()) {
+                return List.of(allele.ref().length() == 1 ? List.of(allele) : substitutions(allele.position(), allele.ref(), allele.alt()));
             }
+            if (!isCompound(allele)) {
+                return List.of(List.of(allele));
+            }
+            // drop the common leading bases (normalize trims only the common trailing ones)
+            int position = allele.position();
+            String ref = allele.ref();
+            String alt = allele.alt();
+            while (ref.length() > 1 && alt.length() > 1 && ref.charAt(0) == alt.charAt(0)) {
+                ref = ref.substring(1);
+                alt = alt.substring(1);
+                position++;
+            }
+            final boolean deletion = ref.length() > alt.length();
+            final int gap = Math.abs(ref.length() - alt.length());
+            final int aligned = Math.min(ref.length(), alt.length());
+            final List<List<ReadAllele>> result = new ArrayList<>();
+            // the gap after the first g aligned bases
+            for (int g = 0; g <= aligned; g++) {
+                final List<ReadAllele> parts = new ArrayList<>(substitutions(position, ref.substring(0, g), alt.substring(0, g)));
+                parts.add(deletion ? reference.deletion(position + g - 1, gap) : reference.insertion(position + g - 1, alt.substring(g, g + gap)));
+                final int tailRef = position + g + (deletion ? gap : 0);
+                parts.addAll(substitutions(tailRef, ref.substring(deletion ? g + gap : g), alt.substring(deletion ? g : g + gap)));
+                result.add(parts);
+            }
+            return result;
+        }
+
+        /** @return the single-base substitutions between equal-length bases {@code ref} and {@code alt} at {@code position} */
+        private static List<ReadAllele> substitutions(final int position, final String ref, final String alt) {
             final List<ReadAllele> result = new ArrayList<>();
-            for (int i = 0; i < allele.ref().length(); i++) {
-                if (allele.ref().charAt(i) != allele.alt().charAt(i)) {
-                    result.add(new ReadAllele(allele.position() + i, allele.ref().substring(i, i + 1), allele.alt().substring(i, i + 1)));
+            for (int i = 0; i < ref.length(); i++) {
+                if (ref.charAt(i) != alt.charAt(i)) {
+                    result.add(new ReadAllele(position + i, ref.substring(i, i + 1), alt.substring(i, i + 1)));
                 }
             }
             return result;
         }
+    }
+
+    /**
+     * @return whether an allele with its common trailing bases trimmed (as {@link Reference#normalize} gives it) is a
+     * compound allele: reference and alternate alleles of different lengths whose first bases differ, or that are both
+     * longer than one base, so not a plain indel
+     */
+    private static boolean isCompound(final ReadAllele allele) {
+        return allele.ref().length() != allele.alt().length()
+                && (allele.ref().charAt(0) != allele.alt().charAt(0) || Math.min(allele.ref().length(), allele.alt().length()) > 1);
     }
 
     private static boolean hasOverlap(final List<ReadAllele> sorted) {

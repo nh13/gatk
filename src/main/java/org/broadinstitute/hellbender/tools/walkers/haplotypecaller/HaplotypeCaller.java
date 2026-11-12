@@ -6,6 +6,7 @@ import htsjdk.variant.variantcontext.writer.VariantContextWriter;
 import org.broadinstitute.barclay.argparser.Argument;
 import org.broadinstitute.barclay.argparser.ArgumentCollection;
 import org.broadinstitute.barclay.argparser.CommandLineArgumentParser;
+import org.broadinstitute.barclay.argparser.CommandLineException;
 import org.broadinstitute.barclay.argparser.CommandLineProgramProperties;
 import org.broadinstitute.barclay.help.DocumentedFeature;
 import org.broadinstitute.hellbender.cmdline.GATKPlugin.GATKReadFilterPluginDescriptor;
@@ -244,6 +245,15 @@ public class HaplotypeCaller extends AssemblyRegionWalker {
             throw new UserException("--" + Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME + " is validated only in DRAGEN mode and requires --" +
                     HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME + " (or --" + HaplotypeCallerArgumentCollection.DRAGEN_378_GATK_MODE_LONG_NAME +
                     "). Add --" + HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME + ", or remove --" + Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+        }
+        if (mq0RescueArgs.enabled && mq0RescueArgs.mode == null) {
+            throw new CommandLineException.BadArgumentValue(Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME, "null",
+                    "must be " + Mq0RescueArgumentCollection.Mode.INJECT + " or " + Mq0RescueArgumentCollection.Mode.ASSEMBLE);
+        }
+        final List<String> givenInjectOnlyArguments = Mq0RescueArgumentCollection.givenInjectOnlyArguments((CommandLineArgumentParser) getCommandLineParser());
+        if (mq0RescueArgs.enabled && mq0RescueArgs.mode == Mq0RescueArgumentCollection.Mode.ASSEMBLE && !givenInjectOnlyArguments.isEmpty()) {
+            logger.warn("Ignoring " + givenInjectOnlyArguments.stream().map(name -> "--" + name).collect(Collectors.joining(", ")) +
+                    ", which only apply with --" + Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME + " " + Mq0RescueArgumentCollection.Mode.INJECT);
         }
         // The regular path applies the population priors to GVCF records inside ReferenceConfidenceModel; rather than
         // write rescue records without them next to regular records with them, the combination is not allowed.

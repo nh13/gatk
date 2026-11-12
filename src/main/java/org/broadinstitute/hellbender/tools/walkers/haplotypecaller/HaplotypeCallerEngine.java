@@ -174,6 +174,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
     private long mq0CallsMade = 0;
     private long mq0NotCalls = 0;
     private long mq0Unsupported = 0;
+    private long mq0UnsupportedCompound = 0;
     private long mq0SpanningDeletions = 0;
     private long mq0GivenAlleles = 0;
     private long mq0CallsKept = 0;
@@ -435,6 +436,11 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         final ReadLikelihoodCalculationEngine likelihoodCalculationEngine;
         final ReadLikelihoodCalculationEngine filterStepLikelihoodCalculationEngine;
         final ReadLikelihoodCalculationEngine pdhmmLikelihoodCalculationEngine;
+        // Assembler for rescue calls, built with the assembly debug outputs off: the factory reads them from the shared
+        // arguments, and the setters below turn off each of them (a debug output added to the factory must be turned
+        // off here too). ASSEMBLE mode assembles with it; INJECT mode only uses it to set up the assembly result it
+        // inserts the events into, which keeps the two modes on one code path.
+        final ReadThreadingAssembler assemblyEngine;
 
         RescueEngines(final HaplotypeCallerArgumentCollection hcArgs, final SampleList samples, final VariantAnnotatorEngine annotationEngine,
                       final Collection<Integer> customPloidies) {
@@ -464,6 +470,11 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
                 likelihoodArgs.pairHmmResultsFile = pairHmmResultsFile;
                 hcArgs.pileupDetectionArgs.pdhmmDebugOutputResults = pdhmmDebugOutputResults;
             }
+            assemblyEngine = hcArgs.createReadThreadingAssembler();
+            assemblyEngine.setDebug(false);
+            assemblyEngine.setDebugGraphTransformations(false);
+            assemblyEngine.setGraphWriter(null);
+            assemblyEngine.setDebugHistogramOutput(null);
         }
 
         void close() {
@@ -897,9 +908,10 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
     /**
      * Assembles and genotypes a region.
      *
-     * @param rescueEventSets null for the regular calling path. Otherwise a MAPQ-0 rescue call, which skips assembly:
-     *                        the haplotypes are the reference haplotype and the reference haplotype with each set of
-     *                        events inserted into it. It uses the rescue engines (see {@link RescueEngines}), a
+     * @param rescueEventSets null for the regular calling path. Otherwise a MAPQ-0 rescue call: in INJECT mode
+     *                        assembly is skipped and the haplotypes are the reference haplotype and the reference haplotype
+     *                        with each set of events inserted into it; in ASSEMBLE mode the region is assembled with
+     *                        the rescue assembler. It uses the rescue engines (see {@link RescueEngines}), a
      *                        genotyping mapping-quality threshold of 0 and no given alleles, writes nothing to the
      *                        debug or bamout side outputs, and returns only the genotyper's calls (no
      *                        reference-confidence records).
@@ -907,6 +919,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
     private List<VariantContext> callRegion(final AssemblyRegion region, final FeatureContext features, final ReferenceContext referenceContext,
                                             final List<List<Event>> rescueEventSets) {
         final boolean rescue = rescueEventSets != null;
+        final boolean inject = rescue && hcArgs.mq0RescueArgs.mode == Mq0RescueArgumentCollection.Mode.INJECT;
+        // ASSEMBLE-mode rescue calls get no event sets to insert
+        Utils.validate(inject || rescueEventSets == null || rescueEventSets.isEmpty(), "event sets given to an ASSEMBLE-mode rescue call");
         final HaplotypeCallerGenotypingEngine localGenotypingEngine = rescue ? getLocalRescueGenotypingEngine(region) : getLocalGenotypingEngine(region);
 
         if ( hcArgs.justDetermineActiveRegions ) {
@@ -954,8 +969,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         }
 
         // run the local assembler, getting back a collection of information on how we should proceed
-        final AssemblyResultSet untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader, samplesList, logger, referenceReader, assemblyEngine, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities, hcArgs.fbargs, rescue);
-        if (rescue) {
+        final AssemblyResultSet untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader, samplesList, logger, referenceReader,
+                rescue ? mq0RescueEngines.assemblyEngine : assemblyEngine, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities, hcArgs.fbargs, inject);
+        if (inject) {
             untrimmedAssemblyResult.addGivenEventSets(rescueEventSets, hcArgs.maxMnpDistance, aligner, hcArgs.getHaplotypeToReferenceSWParameters());
         }
 
@@ -1317,8 +1333,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
     /**
      * The MAPQ-0 rescue step for one region, run after the region's regular calls are made. If MAPQ-0 reads carry an
      * allele often enough at positions of the region span that are more than the rescue distance from every regular
-     * call in the region, the region is genotyped again with all reads, against the reference haplotype with those
-     * alleles inserted into it. Of the resulting records, those that call a non-reference genotype with QUAL at least
+     * call in the region, the region is genotyped again with all reads: in INJECT mode against the reference haplotype
+     * with those alleles inserted into it, in ASSEMBLE mode against the haplotypes of a new assembly, which can hold
+     * other alleles too. Either way, of the resulting records, those that call a non-reference genotype with QUAL at least
      * --mq0-rescue-min-call-qual, whose called alleles MAPQ-0 reads carry, that have no '*' allele and that overlap no
      * --alleles record, are returned as rescue records.
      *
@@ -1346,12 +1363,15 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         if (triggerPositions.isEmpty()) {
             return Collections.emptyList();
         }
+        // In ASSEMBLE mode too, a region is genotyped again only if INJECT mode would insert some allele at the trigger
+        // positions, so that both modes genotype the same regions again; the event sets are made in INJECT mode only.
         final Set<Mq0RescueUtils.ReadAllele> selected = mq0Alleles.selectAlleles(triggerPositions, args.minAltReads,
                 hcArgs.assemblerArgs.maxNumHaplotypesInPopulation);
         if (selected.isEmpty()) {
             return Collections.emptyList();
         }
-        final List<List<Event>> rescueEventSets = mq0Alleles.eventSets(selected, args.minAltReads, args.maxEventSets);
+        final List<List<Event>> rescueEventSets = args.mode == Mq0RescueArgumentCollection.Mode.INJECT ?
+                mq0Alleles.eventSets(selected, args.minAltReads, args.maxEventSets) : Collections.emptyList();
         mq0RegionsTried++;
 
         final List<VariantContext> calls = Utils.runWithRandomGenerators(rescueSeed(span), () -> HaplotypeCallerGenotypingDebugger.runDisabled(() -> withDebugSwitchesOff(() -> {
@@ -1378,6 +1398,11 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
                 mq0NotCalls++;
             } else if (!mq0Alleles.supportsCalledAlleles(call)) {
                 mq0Unsupported++;
+                // records with a compound allele (an indel and substitutions together), which ASSEMBLE mode makes, are
+                // counted apart, since the reads carry such an allele as several (see AlleleCounts#decompositions)
+                if (mq0Alleles.hasCompoundAllele(call)) {
+                    mq0UnsupportedCompound++;
+                }
             } else if (call.hasAllele(Allele.SPAN_DEL)) {
                 // A '*' allele refers to a deletion upstream that the rescue genotyper saw, which may not be written
                 // (not as a rescue record, if it is not a call). Which records get one depends on the deletions the
@@ -1475,10 +1500,10 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         if (mq0Merger != null) {
             logger.info(String.format("MAPQ-0 rescue: regions with MAPQ-0 reads: %d (MAPQ-0 reads held at most: %d); " +
                             "regions genotyped again: %d; records from that genotyping: %d, of which not non-reference calls in the region: %d, " +
-                            "with a called allele no MAPQ-0 read carries: %d, with a '*' allele: %d, overlapping an --alleles record: %d, " +
+                            "with a called allele no MAPQ-0 read carries: %d (with a compound allele: %d), with a '*' allele: %d, overlapping an --alleles record: %d, " +
                             "rescue records: %d; of these, dropped for overlapping a regular call or record, or an earlier rescue record: %d, " +
                             "dropped for lying within %d bp of a regular call: %d, written: %d (replacing %d non-call regular records)",
-                    mq0RegionsWithReads, mq0Reads.peakSize(), mq0RegionsTried, mq0CallsMade, mq0NotCalls, mq0Unsupported, mq0SpanningDeletions,
+                    mq0RegionsWithReads, mq0Reads.peakSize(), mq0RegionsTried, mq0CallsMade, mq0NotCalls, mq0Unsupported, mq0UnsupportedCompound, mq0SpanningDeletions,
                     mq0GivenAlleles, mq0CallsKept, mq0Merger.droppedOverlap(), hcArgs.mq0RescueArgs.distance, mq0Merger.droppedDistance(),
                     mq0Merger.merged(), mq0Merger.replaced()));
             mq0RescueEngines.close();

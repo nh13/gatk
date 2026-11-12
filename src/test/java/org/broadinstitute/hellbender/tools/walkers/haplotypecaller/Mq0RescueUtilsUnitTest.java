@@ -284,6 +284,40 @@ public class Mq0RescueUtilsUnitTest extends GATKBaseTest {
     }
 
     @Test
+    public void testSupportsCompoundAlleles() {
+        // reads carrying a SNP (G>C at 15) and a deletion of 16 on the same anchor, as assembly writes them: GT to C
+        final Mq0RescueUtils.AlleleCounts deletion = counts(copies(2, "snpDeletion", 11, "GGGGCTTTT", "5M1D4M"));
+        Assert.assertTrue(deletion.supportsCalledAlleles(record(15, "GT", List.of("C"), 0, 1)));
+        // with a padded reference allele, padded at the end or, in a multi-allelic record, at the start
+        Assert.assertTrue(deletion.supportsCalledAlleles(record(15, "GTT", List.of("CT", "<NON_REF>"), 0, 1)));
+        Assert.assertTrue(deletion.supportsCalledAlleles(record(14, "GGT", List.of("G", "GC"), 0, 2)));
+        // the plain deletion is carried too, but a SNP the reads do not carry is not
+        Assert.assertTrue(deletion.supportsCalledAlleles(record(15, "GT", List.of("G"), 0, 1)));
+        Assert.assertFalse(deletion.supportsCalledAlleles(record(15, "GT", List.of("A"), 0, 1)));
+        // a compound allele whose substitutions the reads do not all carry (T>A at 17 in each placement of the gap)
+        Assert.assertFalse(deletion.supportsCalledAlleles(record(15, "GTT", List.of("CA"), 0, 1)));
+
+        // the same haplotype aligned with the gap first: a deletion of 15 (left-aligned to after 10) and T>C at 16
+        final Mq0RescueUtils.AlleleCounts gapFirst = counts(copies(2, "deletionSnp", 11, "GGGGCTTT", "4M1D3M"));
+        Assert.assertTrue(gapFirst.supportsCalledAlleles(record(15, "GT", List.of("C"), 0, 1)));
+
+        // a SNP and an insertion on the same anchor: G to CT, a G>C at 15 and a T inserted after it, or, aligned with
+        // the gap first, a C inserted after 14 and G>T at 15
+        final Mq0RescueUtils.AlleleCounts insertion = counts(copies(2, "snpInsertion", 11, "GGGGCTTTTTT", "5M1I5M"));
+        Assert.assertTrue(insertion.supportsCalledAlleles(record(15, "G", List.of("CT"), 0, 1)));
+        Assert.assertFalse(insertion.supportsCalledAlleles(record(15, "G", List.of("CA"), 0, 1)));
+        final Mq0RescueUtils.AlleleCounts insertionFirst = counts(copies(2, "insertionSnp", 11, "GGGGCTTTTT", "4M1I5M"));
+        Assert.assertTrue(insertionFirst.supportsCalledAlleles(record(15, "G", List.of("CT"), 0, 1)));
+
+        // only called alleles count as compound
+        Assert.assertTrue(deletion.hasCompoundAllele(record(15, "GT", List.of("C"), 0, 1)));
+        Assert.assertTrue(deletion.hasCompoundAllele(record(15, "GTT", List.of("CA"), 0, 1)));
+        Assert.assertTrue(deletion.hasCompoundAllele(record(14, "GGT", List.of("G", "GC"), 0, 2)));
+        Assert.assertFalse(deletion.hasCompoundAllele(record(15, "GT", List.of("G"), 0, 1)));
+        Assert.assertFalse(deletion.hasCompoundAllele(record(15, "GT", List.of("G", "C"), 0, 1)));
+    }
+
+    @Test
     public void testIsCall() {
         Assert.assertTrue(Mq0RescueUtils.isCall(call(100, 50, REF_A, ALT_C), 3.0));
         Assert.assertTrue(Mq0RescueUtils.isCall(call(100, 50, ALT_C, ALT_C), 3.0));
