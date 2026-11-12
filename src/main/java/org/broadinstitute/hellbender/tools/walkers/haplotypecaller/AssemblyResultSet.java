@@ -3,6 +3,8 @@ package org.broadinstitute.hellbender.tools.walkers.haplotypecaller;
 
 import com.google.common.annotations.VisibleForTesting;
 import htsjdk.samtools.Cigar;
+import htsjdk.samtools.CigarElement;
+import htsjdk.samtools.CigarOperator;
 import htsjdk.samtools.util.Locatable;
 import htsjdk.variant.variantcontext.Allele;
 import htsjdk.variant.vcf.VCFConstants;
@@ -765,6 +767,44 @@ public final class AssemblyResultSet {
         regenerateVariationEvents(maxMnpDistance);
     }
 
+    /**
+     * Inserts sets of events into the reference haplotype, giving one new haplotype per set, unless the same haplotype
+     * is already present. The events of a set are inserted together, so the new haplotype carries them all; a set may
+     * hold a single event. Each set must be sorted by start, with no two events overlapping, and no event symbolic.
+     *
+     * <p>A substitution (reference and alternate alleles of the same length) inserted into a haplotype that so far
+     * differs from the reference by substitutions only gets an all-match CIGAR, not a Smith-Waterman alignment to the
+     * reference. That is the alignment the insertion implies, so the new haplotype's events are the events inserted.
+     * Smith-Waterman can align such a haplotype with a pair of gaps instead: where the substitutions shift a repeat,
+     * or for an MNP of three or more bases near an end of the haplotype. For a single SNP the two agree.</p>
+     */
+    void addGivenEventSets(final List<List<Event>> eventSets, final int maxMnpDistance, final SmithWatermanAligner aligner,
+                           final SWParameters haplotypeToReferenceSWParameters) {
+        if (eventSets.isEmpty()) {
+            return;
+        }
+        final Haplotype refHaplotype = getReferenceHaplotype();
+        for (final List<Event> events : eventSets) {
+            for (int i = 0; i < events.size(); i++) {
+                final Event event = events.get(i);
+                Utils.validateArg(!isSymbolic(event.altAllele()), () -> "symbolic event " + event);
+                Utils.validateArg(i == 0 || (events.get(i - 1).getStart() < event.getStart() && !events.get(i - 1).overlaps(event)),
+                        () -> "events not sorted by start or overlapping: " + events);
+            }
+            Haplotype h = refHaplotype;
+            for (final Event event : events) {
+                h = makeHaplotypeWithInsertedEvent(h, refHaplotype, event, aligner, haplotypeToReferenceSWParameters, true);
+                if (h == null) {
+                    break;
+                }
+            }
+            if (h != null) {
+                add(h);
+            }
+        }
+        regenerateVariationEvents(maxMnpDistance);
+    }
+
     private static boolean isEventPresentInAssembly(final Event event, final List<Event> assembledEvents) {
         return assembledEvents.stream().anyMatch(event::equals);    // note that Events are forced to have a minimal representation
     }
@@ -776,13 +816,28 @@ public final class AssemblyResultSet {
     // returns a new haplotype with the event inserted or null if that is not possible
     private static Haplotype makeHaplotypeWithInsertedEvent(final Haplotype baseHaplotype, final Haplotype refHaplotype, final Event event,
                                                             final SmithWatermanAligner aligner, final SWParameters haplotypeToReferenceSWParameters) {
+        return makeHaplotypeWithInsertedEvent(baseHaplotype, refHaplotype, event, aligner, haplotypeToReferenceSWParameters, false);
+    }
+
+    /**
+     * @param substitutionFastPath if true, a substitution inserted into a haplotype that aligns to the reference
+     *                             without indels gets an all-match CIGAR directly instead of a Smith-Waterman
+     *                             alignment to the reference
+     */
+    private static Haplotype makeHaplotypeWithInsertedEvent(final Haplotype baseHaplotype, final Haplotype refHaplotype, final Event event,
+                                                            final SmithWatermanAligner aligner, final SWParameters haplotypeToReferenceSWParameters,
+                                                            final boolean substitutionFastPath) {
         if (baseHaplotype.getEventMap() != null && baseHaplotype.getEventMap().getEvents().stream().anyMatch(event::overlaps)) {
             return null; // Can't insert because the base haplotype already has an event there.
         }
 
         final Haplotype insertedHaplotype = baseHaplotype.insertAllele(event.refAllele(), event.altAllele(), event.getStart());
         if (insertedHaplotype != null) { // can be null if the requested allele can't be inserted into the haplotype
-            final Cigar cigar = CigarUtils.calculateCigar(refHaplotype.getBases(), insertedHaplotype.getBases(), aligner, haplotypeToReferenceSWParameters, SWOverhangStrategy.INDEL);
+            final boolean ungapped = substitutionFastPath && event.refAllele().length() == event.altAllele().length()
+                    && insertedHaplotype.length() == refHaplotype.length() && baseHaplotype.getCigar() != null
+                    && baseHaplotype.getCigar().numCigarElements() == 1 && baseHaplotype.getCigar().getFirstCigarElement().getOperator() == CigarOperator.M;
+            final Cigar cigar = ungapped ? new Cigar(Collections.singletonList(new CigarElement(refHaplotype.length(), CigarOperator.M))) :
+                    CigarUtils.calculateCigar(refHaplotype.getBases(), insertedHaplotype.getBases(), aligner, haplotypeToReferenceSWParameters, SWOverhangStrategy.INDEL);
             insertedHaplotype.setCigar(cigar);
             insertedHaplotype.setGenomeLocation(refHaplotype.getGenomeLocation());
             insertedHaplotype.setAlignmentStartHapwrtRef(refHaplotype.getAlignmentStartHapwrtRef());

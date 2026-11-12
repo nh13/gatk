@@ -4,11 +4,13 @@ import com.google.common.collect.Maps;
 import htsjdk.samtools.*;
 import htsjdk.samtools.util.Locatable;
 import htsjdk.variant.variantcontext.*;
+import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.mutable.MutableInt;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.logging.log4j.LogManager;
 import org.broadinstitute.hellbender.GATKBaseTest;
+import org.broadinstitute.gatk.nativebindings.smithwaterman.SWOverhangStrategy;
 import org.broadinstitute.gatk.nativebindings.smithwaterman.SWParameters;
 import org.broadinstitute.hellbender.engine.AssemblyRegion;
 import org.broadinstitute.hellbender.tools.FlowBasedArgumentCollection;
@@ -23,6 +25,7 @@ import org.broadinstitute.hellbender.utils.haplotype.Event;
 import org.broadinstitute.hellbender.utils.haplotype.EventMap;
 import org.broadinstitute.hellbender.utils.haplotype.Haplotype;
 import org.broadinstitute.hellbender.utils.read.ArtificialReadUtils;
+import org.broadinstitute.hellbender.utils.read.CigarUtils;
 import org.broadinstitute.hellbender.utils.read.GATKRead;
 import org.broadinstitute.hellbender.utils.read.SAMRecordToGATKReadAdapter;
 import org.broadinstitute.hellbender.utils.smithwaterman.SmithWatermanAligner;
@@ -1263,6 +1266,169 @@ public class AssemblyBasedCallerUtilsUnitTest extends GATKBaseTest {
         assemblyResultSet.addGivenAlleles(Collections.singletonList(givenEvent5), maxMnpDistance,
                 aligner, HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS);
         Assert.assertEquals(assemblyResultSet.getHaplotypeCount(), 7);
+    }
+
+    private static AssemblyResultSet resultSetWithReference(final String refBases) {
+        final AssemblyResultSet assemblyResultSet = new AssemblyResultSet();
+        // no padding, so that base i of a haplotype is at position i + 1 both for inserting events and in event maps
+        final Haplotype refHaplotype = new Haplotype(refBases.getBytes(), true);
+        refHaplotype.setAlignmentStartHapwrtRef(0);
+        refHaplotype.setCigar(new Cigar(Collections.singletonList(new CigarElement(refHaplotype.length(), CigarOperator.M))));
+        refHaplotype.setGenomeLocation(new SimpleInterval("chr", 1, refHaplotype.length()));
+        assemblyResultSet.setPaddedReferenceLoc(new SimpleInterval("chr", 1, refHaplotype.length()));
+        assemblyResultSet.add(refHaplotype);
+        assemblyResultSet.setFullReferenceWithPadding(refHaplotype.getBases());
+        return assemblyResultSet;
+    }
+
+    private static Haplotype haplotypeFromReference(final AssemblyResultSet assemblyResultSet, final String bases, final double score) {
+        final Haplotype refHaplotype = assemblyResultSet.getReferenceHaplotype();
+        final Haplotype haplotype = new Haplotype(bases.getBytes(), false);
+        haplotype.setAlignmentStartHapwrtRef(refHaplotype.getAlignmentStartHapwrtRef());
+        haplotype.setCigar(CigarUtils.calculateCigar(refHaplotype.getBases(), haplotype.getBases(),
+                SmithWatermanAligner.getAligner(SmithWatermanAligner.Implementation.JAVA), HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS, SWOverhangStrategy.INDEL));
+        haplotype.setGenomeLocation(refHaplotype.getGenomeLocation());
+        haplotype.setScore(score);
+        return haplotype;
+    }
+
+    private static Event snp(final int pos, final char ref, final char alt) {
+        return new Event("chr", pos, Allele.create((byte) ref, true), Allele.create((byte) alt));
+    }
+
+    @Test
+    public void testAddGivenEventSets() {
+        final int maxMnpDistance = 0;
+        final SmithWatermanAligner aligner = SmithWatermanAligner.getAligner(SmithWatermanAligner.Implementation.FASTEST_AVAILABLE);
+        final AssemblyResultSet assemblyResultSet = resultSetWithReference("AAAACCCCGGGGTTTT");
+
+        // single events each go into the reference haplotype; substitutions get an all-match CIGAR, the deletion a gapped
+        // one; a set of events carried together goes into one haplotype, but not into the single-event haplotypes; a
+        // substitution after a deletion in the same set is aligned, not given an all-match CIGAR
+        final Event snp1 = snp(2, 'A', 'C');
+        final Event snp2 = snp(13, 'T', 'A');
+        final Event deletion = new Event("chr", 8, Allele.create("CGG".getBytes(), true), Allele.create((byte) 'C'));
+        assemblyResultSet.addGivenEventSets(List.of(List.of(snp1), List.of(snp2), List.of(deletion), List.of(snp1, snp2), List.of(deletion, snp2)),
+                maxMnpDistance, aligner, HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS);
+        final List<Haplotype> haplotypes = assemblyResultSet.getHaplotypeList();
+        Assert.assertEquals(haplotypes.size(), 6);
+        Assert.assertEquals(haplotypes.get(1).getBaseString(), "ACAACCCCGGGGTTTT");
+        Assert.assertEquals(haplotypes.get(1).getCigar().toString(), "16M");
+        Assert.assertEquals(haplotypes.get(2).getBaseString(), "AAAACCCCGGGGATTT");
+        Assert.assertEquals(haplotypes.get(2).getCigar().toString(), "16M");
+        Assert.assertEquals(haplotypes.get(3).getBaseString(), "AAAACCCCGGTTTT");
+        Assert.assertTrue(haplotypes.get(3).getCigar().containsOperator(CigarOperator.D));
+        Assert.assertEquals(haplotypes.get(4).getBaseString(), "ACAACCCCGGGGATTT");
+        Assert.assertEquals(haplotypes.get(4).getCigar().toString(), "16M");
+        Assert.assertEquals(haplotypes.get(5).getBaseString(), "AAAACCCCGGATTT");
+        Assert.assertTrue(haplotypes.get(5).getCigar().containsOperator(CigarOperator.D));
+        Assert.assertEquals(new HashSet<>(assemblyResultSet.getVariationEvents(maxMnpDistance)), Set.of(snp1, snp2, deletion));
+
+        // a set whose haplotype is already present adds nothing, and no sets add nothing
+        assemblyResultSet.addGivenEventSets(List.of(List.of(snp1), List.of(snp1, snp2)), maxMnpDistance, aligner, HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS);
+        Assert.assertEquals(assemblyResultSet.getHaplotypeCount(), 6);
+        assemblyResultSet.addGivenEventSets(Collections.emptyList(), maxMnpDistance, aligner, HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS);
+        Assert.assertEquals(assemblyResultSet.getHaplotypeCount(), 6);
+    }
+
+    @DataProvider
+    public Object[][] invalidEventSets() {
+        final Event snp1 = snp(2, 'A', 'C');
+        final Event snp2 = snp(13, 'T', 'A');
+        final Event deletion = new Event("chr", 8, Allele.create("CGG".getBytes(), true), Allele.create((byte) 'C'));
+        return new Object[][]{
+                {List.of(snp2, snp1)},                                     // not sorted
+                {List.of(deletion, snp(9, 'G', 'T'))},                     // overlapping
+                {List.of(snp1, snp1)},                                     // the same event twice
+                {List.of(new Event("chr", 6, Allele.create((byte) 'C', true), Allele.NON_REF_ALLELE))}  // symbolic
+        };
+    }
+
+    @Test(dataProvider = "invalidEventSets", expectedExceptions = IllegalArgumentException.class)
+    public void testAddGivenEventSetsRejectsInvalidSets(final List<Event> events) {
+        resultSetWithReference("AAAACCCCGGGGTTTT").addGivenEventSets(List.of(events), 0,
+                SmithWatermanAligner.getAligner(SmithWatermanAligner.Implementation.JAVA), HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS);
+    }
+
+    @Test
+    public void testAddGivenEventSetsSubstitutionFastPath() {
+        // shifting a dinucleotide repeat by substitutions: Smith-Waterman aligns the result with a gap pair, but the
+        // inserted haplotype gets an all-match CIGAR, so its events are the substitutions that were inserted
+        final String ref = "TTTTTACACACACGGGGG";
+        final String shifted = "TTTTTCACACACAGGGGG";
+        final List<Event> substitutions = new ArrayList<>();
+        for (int i = 0; i < ref.length(); i++) {
+            if (ref.charAt(i) != shifted.charAt(i)) {
+                substitutions.add(snp(i + 1, ref.charAt(i), shifted.charAt(i)));
+            }
+        }
+        Assert.assertEquals(substitutions.size(), 8);
+        final SmithWatermanAligner aligner = SmithWatermanAligner.getAligner(SmithWatermanAligner.Implementation.JAVA);
+        Assert.assertTrue(CigarUtils.calculateCigar(ref.getBytes(), shifted.getBytes(), aligner, HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS,
+                SWOverhangStrategy.INDEL).containsOperator(CigarOperator.D), "the two paths should differ");
+
+        final AssemblyResultSet assemblyResultSet = resultSetWithReference(ref);
+        assemblyResultSet.addGivenEventSets(List.of(substitutions), 0, aligner, HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS);
+        Assert.assertEquals(assemblyResultSet.getHaplotypeCount(), 2);
+        final Haplotype inserted = assemblyResultSet.getHaplotypeList().get(1);
+        Assert.assertEquals(inserted.getBaseString(), shifted);
+        Assert.assertEquals(inserted.getCigar().toString(), ref.length() + "M");
+        Assert.assertEquals(new ArrayList<>(assemblyResultSet.getVariationEvents(0)), substitutions);
+    }
+
+    @Test
+    public void testAddGivenEventSetsSubstitutionAfterIndels() {
+        // an insertion and a deletion leave the haplotype as long as the reference but gapped against it, so a
+        // substitution inserted after them must not get an all-match CIGAR
+        final String ref = "TCAGGATCCAGTTGACCTAGGCTTAACGGA";
+        final Event insertion = new Event("chr", 5, Allele.create("G", true), Allele.create("GC"));
+        final Event deletion = new Event("chr", 17, Allele.create("CT", true), Allele.create("C"));
+        final Event substitution = snp(25, 'A', 'T');
+        final AssemblyResultSet assemblyResultSet = resultSetWithReference(ref);
+        assemblyResultSet.addGivenEventSets(List.of(List.of(insertion, deletion, substitution)), 0,
+                SmithWatermanAligner.getAligner(SmithWatermanAligner.Implementation.JAVA), HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS);
+        Assert.assertEquals(assemblyResultSet.getHaplotypeCount(), 2);
+        final Haplotype inserted = assemblyResultSet.getHaplotypeList().get(1);
+        Assert.assertEquals(inserted.length(), ref.length());
+        Assert.assertTrue(inserted.getCigar().containsOperator(CigarOperator.I), inserted.getCigar().toString());
+        Assert.assertTrue(inserted.getCigar().containsOperator(CigarOperator.D), inserted.getCigar().toString());
+        Assert.assertEquals(new HashSet<>(assemblyResultSet.getVariationEvents(0)), Set.of(insertion, deletion, substitution));
+    }
+
+    @Test
+    public void testAddGivenEventSetsMnpNearEnd() {
+        // an MNP of four bases next to the end of a haplotype, where Smith-Waterman aligns the inserted haplotype with a
+        // pair of gaps for some references: the fast path gives an all-match CIGAR, so the MNP stays one event
+        final SmithWatermanAligner aligner = SmithWatermanAligner.getAligner(SmithWatermanAligner.Implementation.JAVA);
+        final Random random = new Random(42);
+        final byte[] alphabet = "ACGT".getBytes();
+        for (int attempt = 0; attempt < 1000; attempt++) {
+            final byte[] ref = new byte[100];
+            for (int i = 0; i < ref.length; i++) {
+                ref[i] = alphabet[random.nextInt(4)];
+            }
+            // the MNP covers bases from to from + 3, leaving the last base, since an allele cannot be inserted at the end
+            final int from = ref.length - 5;
+            final byte[] alt = new byte[4];
+            for (int i = 0; i < alt.length; i++) {
+                alt[i] = alphabet[(ArrayUtils.indexOf(alphabet, ref[from + i]) + 1 + random.nextInt(3)) % 4];
+            }
+            final byte[] inserted = ref.clone();
+            System.arraycopy(alt, 0, inserted, from, 4);
+            if (!CigarUtils.calculateCigar(ref, inserted, aligner, HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS, SWOverhangStrategy.INDEL)
+                    .containsOperator(CigarOperator.D)) {
+                continue;
+            }
+            final Event mnp = new Event("chr", from + 1, Allele.create(Arrays.copyOfRange(ref, from, from + 4), true), Allele.create(alt));
+            final AssemblyResultSet assemblyResultSet = resultSetWithReference(new String(ref));
+            assemblyResultSet.addGivenEventSets(List.of(List.of(mnp)), 4, aligner, HAPLOTYPE_TO_REFERENCE_SW_PARAMETERS);
+            final Haplotype haplotype = assemblyResultSet.getHaplotypeList().get(1);
+            Assert.assertEquals(haplotype.getBases(), inserted);
+            Assert.assertEquals(haplotype.getCigar().toString(), ref.length + "M");
+            Assert.assertEquals(new ArrayList<>(assemblyResultSet.getVariationEvents(4)), List.of(mnp));
+            return;
+        }
+        Assert.fail("no reference found for which Smith-Waterman gaps the MNP");
     }
 
     @Test
