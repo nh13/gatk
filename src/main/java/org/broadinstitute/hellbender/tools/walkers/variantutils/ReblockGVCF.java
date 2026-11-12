@@ -95,6 +95,23 @@ import java.util.stream.IntStream;
  * annotation is copied only from input whose header declares it, so an input record carrying an annotation its header
  * doesn't declare fails to write unless --lenient is given.</p>
  * <p>Note that when uncalled alleles are dropped, the original GQ may increase.  Use --keep-all-alts if GQ accuracy is a concern.</p>
+ * <p>Records from HaplotypeCaller's MAPQ-0 rescue (--mq0-rescue) keep their markers, so that they stay distinguishable
+ * from the regular calls:</p>
+ * <ul>
+ *     <li>The INFO fields of {@link GATKVCFConstants#MQ0_RESCUE_INFO_KEYS} that the input header declares are copied as
+ *     they are (the depths describe HaplotypeCaller's reads and are not recomputed), as if given with
+ *     --annotations-to-keep.</li>
+ *     <li>The FILTER {@value GATKVCFConstants#MQ0_RESCUE_FILTER_NAME} follows the {@value GATKVCFConstants#MQ0_RESCUE_KEY}
+ *     INFO flag, not the input's FILTER column, because the --drop-low-quals path regenotypes records and loses their
+ *     filters: a record with the flag gets the filter, even without --keep-site-filters and even if it was cleared
+ *     upstream, and its header line is added if the input lacks it.</li>
+ *     <li>With --add-site-filters-to-genotype the genotype's FT holds the filter too. Note that GenotypeGVCFs, reading
+ *     through GenomicsDB, treats such genotypes as filtered and leaves rescue calls out.</li>
+ *     <li>A rescue record turned into a reference block loses its markers.</li>
+ *     <li>If the input header declares the filter but not the flag, the filter is not re-derived: like any site filter,
+ *     it is kept only with --keep-site-filters (and lost where --drop-low-quals regenotypes the record), and copied to
+ *     FT with --add-site-filters-to-genotype. The depths are still copied if declared. A warning says all this.</li>
+ * </ul>
  *
  */
 @CommandLineProgramProperties(summary = "Compress a single-sample GVCF from HaplotypeCaller by merging homRef blocks using new GQ band parameters",
@@ -160,6 +177,9 @@ public final class ReblockGVCF extends MultiVariantWalker {
     @Argument(fullName=ANNOTATIONS_TO_KEEP_LONG_NAME, doc="Annotations that are not recognized by GATK to keep, that should be kept in final GVCF at variant sites.", optional = true)
     private List<String> annotationsToKeep = new ArrayList<>();
 
+    // the INFO annotations kept at variant sites: --annotations-to-keep and the MAPQ-0 rescue INFO keys the input declares
+    private List<String> infoAnnotationsToKeep = new ArrayList<>();
+
     @Advanced
     @Argument(fullName=ANNOTATIONS_TO_REMOVE_LONG_NAME, doc="FORMAT level annotations to remove from all genotypes in final GVCF.", optional = true)
     private List<String> formatAnnotationsToRemove = new ArrayList<>();
@@ -177,11 +197,15 @@ public final class ReblockGVCF extends MultiVariantWalker {
     protected boolean keepAllAlts = false;
 
     @Advanced
-    @Argument(fullName=KEEP_SITE_FILTERS_LONG_NAME, shortName = KEEP_SITE_FILTERS_SHORT_NAME, doc="Keep site level filters for variants (not ref blocks).")
+    @Argument(fullName=KEEP_SITE_FILTERS_LONG_NAME, shortName = KEEP_SITE_FILTERS_SHORT_NAME, doc="Keep site level filters for variants (not ref blocks). Without it, HaplotypeCaller's " +
+            GATKVCFConstants.MQ0_RESCUE_FILTER_NAME + " filter is still set on records with the " + GATKVCFConstants.MQ0_RESCUE_KEY +
+            " INFO flag, from the flag, when the input header declares it.")
     private boolean keepFilters = false;
 
     @Advanced
-    @Argument(fullName= ADD_FILTERS_TO_GENOTYPE, doc="Add site level filters to genotype level. Site level filters removed by default, if they should be kept, use --" + KEEP_SITE_FILTERS_LONG_NAME)
+    @Argument(fullName= ADD_FILTERS_TO_GENOTYPE, doc="Copy the site filters of each variant into its genotype's FT field. The site FILTER column is still cleared " +
+            "unless --" + KEEP_SITE_FILTERS_LONG_NAME + " is given, except for " + GATKVCFConstants.MQ0_RESCUE_FILTER_NAME + " on records with the " +
+            GATKVCFConstants.MQ0_RESCUE_KEY + " INFO flag, which FT then holds too.")
     private boolean addFiltersToFormatField = false;
 
     //TODO: this will be an argument when posteriors handling is fully implemented in AlleleSubsettingUtils
@@ -272,11 +296,14 @@ public final class ReblockGVCF extends MultiVariantWalker {
             headerLines.add(GATKVCFHeaderLines.getInfoLine(GATKVCFConstants.MAPPING_QUALITY_DEPTH_DEPRECATED));  //NOTE: this is deprecated, but keep until we reprocess all GVCFs
         }
 
-        for(String annotation : annotationsToKeep) {
+        setUpMq0RescueMarkers(inputHeader, headerLines);
+
+        for(String annotation : infoAnnotationsToKeep) {
             if(inputHeader.hasInfoLine(annotation)) {
                 VCFInfoHeaderLine headerLine = inputHeader.getInfoHeaderLine(annotation);
                 if (headerLine.getCountType().equals(VCFHeaderLineCount.A)) {
-                    throw new UserException(String.format("%s is an allele specific annotation which is currently unsupported. Only fixed length annotations may be kept in reblocking.", annotation));
+                    throw new UserException(String.format("%s is an allele specific annotation which is currently unsupported. Only fixed length annotations may be kept in reblocking%s.", annotation,
+                            annotationsToKeep.contains(annotation) ? "" : " (it is kept as a MAPQ-0 rescue INFO key, so its input header line must be the one HaplotypeCaller writes)"));
                 }
                 headerLines.add(inputHeader.getInfoHeaderLine(annotation));
             } else {
@@ -344,9 +371,9 @@ public final class ReblockGVCF extends MultiVariantWalker {
     /**
      * Returns the INFO keys an output record can carry: END, the annotations this tool computes, the legacy mapping
      * quality keys when the input has them, the annotation engine's keys that {@link #copyInfoAnnotations} copies from
-     * input records (so only those the input declares), and the ones requested with --annotations-to-keep. The engine
-     * declares header lines for final annotations such as QD and FS, which this tool never computes, so a line for a key
-     * outside this set would describe a field no record carries.
+     * input records (so only those the input declares), and those kept as given (--annotations-to-keep and the MAPQ-0
+     * rescue INFO keys the input declares). The engine declares header lines for final annotations such as QD and FS,
+     * which this tool never computes, so a line for a key outside this set would describe a field no record carries.
      */
     private Set<String> getInfoKeysWritten(final VCFHeader inputHeader) {
         final Set<String> keys = new HashSet<>(Arrays.asList(VCFConstants.END_KEY, VCFConstants.DEPTH_KEY,
@@ -365,7 +392,39 @@ public final class ReblockGVCF extends MultiVariantWalker {
                     .filter(key -> !infoFieldAnnotationKeyNamesToRemove.contains(key))
                     .forEach(keys::add);
         }
-        keys.addAll(annotationsToKeep);
+        keys.addAll(infoAnnotationsToKeep);
+        return keys;
+    }
+
+    /**
+     * Sets up the MAPQ-0 rescue markers (see the class documentation): the rescue INFO keys the input declares are kept
+     * along with --annotations-to-keep, and the rescue FILTER is declared if the input declares the flag.
+     */
+    private void setUpMq0RescueMarkers(final VCFHeader inputHeader, final Set<VCFHeaderLine> headerLines) {
+        infoAnnotationsToKeep = withMq0RescueInfoKeys(annotationsToKeep).stream()
+                .filter(key -> annotationsToKeep.contains(key) || inputHeader.hasInfoLine(key))
+                .collect(Collectors.toList());
+        if (inputHeader.hasInfoLine(GATKVCFConstants.MQ0_RESCUE_KEY)) {
+            // rescue records get the filter back from the flag, so it must be declared even if the input lacks it
+            if (inputHeader.getFilterHeaderLine(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME) == null) {
+                headerLines.add(GATKVCFHeaderLines.getFilterLine(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME));
+            }
+        } else if (inputHeader.getFilterHeaderLine(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME) != null) {
+            logger.warn("The input header declares the " + GATKVCFConstants.MQ0_RESCUE_FILTER_NAME + " filter but not the " +
+                    GATKVCFConstants.MQ0_RESCUE_KEY + " INFO flag, so the filter is not re-derived from the flag: like any site filter, it is " +
+                    "kept only on records that carry it with --" + KEEP_SITE_FILTERS_LONG_NAME + " (records that carry it lose it by default), " +
+                    "lost on records --" + DROP_LOW_QUALS_ARG_NAME + " regenotypes, and copied to FT with --" + ADD_FILTERS_TO_GENOTYPE +
+                    "; the " + GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY + " and " + GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY + " depths are still kept if declared");
+        }
+    }
+
+    /**
+     * @return {@code annotationsToKeep} followed by the MAPQ-0 rescue INFO keys it does not hold: the INFO annotations
+     * ReblockGVCF keeps at variant sites, if the input declares them
+     */
+    static List<String> withMq0RescueInfoKeys(final List<String> annotationsToKeep) {
+        final List<String> keys = new ArrayList<>(annotationsToKeep);
+        GATKVCFConstants.MQ0_RESCUE_INFO_KEYS.stream().filter(key -> !keys.contains(key)).forEach(keys::add);
         return keys;
     }
 
@@ -462,7 +521,7 @@ public final class ReblockGVCF extends MultiVariantWalker {
                 return;
             }
             //make sure result has annotations so we don't have to keep originalVC around
-            result = new VariantContextBuilder(regenotyped).attributes(subsetAnnotationsIfNecessary(annotationEngine, doQualApprox, posteriorsKey, originalVC, regenotyped, annotationsToKeep)).make();
+            result = new VariantContextBuilder(regenotyped).attributes(subsetAnnotationsIfNecessary(annotationEngine, doQualApprox, posteriorsKey, originalVC, regenotyped, infoAnnotationsToKeep)).make();
         }
 
 
@@ -497,7 +556,7 @@ public final class ReblockGVCF extends MultiVariantWalker {
     static Map<String, Object> subsetAnnotationsIfNecessary(final VariantAnnotatorEngine annotationEngine,
                                                             final boolean doQualApprox, final String posteriorsKey,
                                                             final VariantContext originalVC, final VariantContext regenotyped,
-                                                            final List<String> annotationsToKeep) {
+                                                            final List<String> infoKeysToKeep) {
         final Map<String, Object> newAnnotations;
         if (regenotyped.getNAlleles() != originalVC.getNAlleles()) {
             final Permutation<Allele> allelePermutation = new IndexedAlleleList<>(originalVC.getAlleles()).
@@ -505,7 +564,7 @@ public final class ReblockGVCF extends MultiVariantWalker {
             final int[] relevantIndices = IntStream.range(0, regenotyped.getAlleles().size())
                     .map(n -> allelePermutation.fromIndex(n)).toArray();
             newAnnotations = new LinkedHashMap<>();
-            composeUpdatedAnnotations(newAnnotations, doQualApprox, posteriorsKey, originalVC, annotationEngine, relevantIndices, regenotyped, annotationsToKeep);
+            composeUpdatedAnnotations(newAnnotations, doQualApprox, posteriorsKey, originalVC, annotationEngine, relevantIndices, regenotyped, infoKeysToKeep);
         } else {
             newAnnotations = originalVC.getAttributes();
         }
@@ -724,18 +783,32 @@ public final class ReblockGVCF extends MultiVariantWalker {
         final VariantContext updatedAllelesVC = builder.make();
         final Genotype updatedAllelesGenotype = updatedAllelesVC.getGenotype(0);
 
+        composeUpdatedAnnotations(attrMap, doQualApprox, posteriorsKey, variant, annotationEngine, relevantIndices, updatedAllelesVC, infoAnnotationsToKeep);
+        // A MAPQ-0 rescue record keeps its filter whatever the path, since the flag is kept on every path (the
+        // --drop-low-quals regenotyping loses the input filters) and since the filter is otherwise cleared without
+        // --keep-site-filters.
+        final boolean rescue = attrMap.containsKey(GATKVCFConstants.MQ0_RESCUE_KEY);
+
         //remove any AD reads for the non-ref
         final Genotype g = removeNonRefADs(updatedAllelesGenotype, updatedAllelesVC.getAlleleIndex(Allele.NON_REF_ALLELE));
         if (addFiltersToFormatField) {
-            final List<String> filters = updatedAllelesVC.getFilters().stream().toList();
-            builder.genotypes(new GenotypeBuilder(g).filters(filters).make());
+            final Set<String> filters = new LinkedHashSet<>(updatedAllelesVC.getFilters());
+            if (rescue) {
+                filters.add(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME);
+            }
+            builder.genotypes(new GenotypeBuilder(g).filters(new ArrayList<>(filters)).make());
         } else {
             builder.genotypes(g);
         }
 
-        composeUpdatedAnnotations(attrMap, doQualApprox, posteriorsKey, variant, annotationEngine, relevantIndices, updatedAllelesVC, annotationsToKeep);
-
-        return keepFilters ? builder.attributes(attrMap).make() : builder.attributes(attrMap).unfiltered().make();
+        builder.attributes(attrMap);
+        if (!keepFilters) {
+            builder.unfiltered();
+        }
+        if (rescue) {
+            builder.filter(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME);
+        }
+        return builder.make();
     }
 
     /**
@@ -804,7 +877,7 @@ public final class ReblockGVCF extends MultiVariantWalker {
      * @param updatedAllelesVC  variant context with final set of alleles
      */
     private static void composeUpdatedAnnotations(final Map<String, Object> destination, final boolean doQualApprox, final String posteriorsKey, final VariantContext variant, final VariantAnnotatorEngine annotationEngine,
-                                                  final int[] relevantIndices, final VariantContext updatedAllelesVC, final List<String> annotationsToKeep) {
+                                                  final int[] relevantIndices, final VariantContext updatedAllelesVC, final List<String> infoKeysToKeep) {
         updateMQAnnotations(destination, variant);
 
         final boolean allelesNeedSubsetting = relevantIndices.length < variant.getNAlleles();
@@ -826,7 +899,7 @@ public final class ReblockGVCF extends MultiVariantWalker {
         }
         destination.put(GATKVCFConstants.RAW_GENOTYPE_COUNT_KEY, updatedAllelesGenotype.getAlleles().stream().anyMatch(Allele::isReference) ?
                 Arrays.asList(0,1,0) : Arrays.asList(0,0,1)); //ExcessHet currently uses rounded/integer genotype counts, so do the same here
-        for (String annotation : annotationsToKeep) {
+        for (String annotation : infoKeysToKeep) {
             if (variant.hasAttribute(annotation)) {
                 destination.put(annotation, variant.getAttribute(annotation));
             }
