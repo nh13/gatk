@@ -87,6 +87,7 @@ public class GATKVCFHeaderLines {
         addInfoLine(new VCFInfoHeaderLine(GATKVCFConstants.AC_ADJUSTED_KEY, VCFHeaderLineCount.A, VCFHeaderLineType.Integer, "Allele count for each ALT, adjusted to represent high quality genotypes only"));
 
         addFilterLine(new VCFFilterHeaderLine(LOW_QUAL_FILTER_NAME, "Low quality"));
+        addFilterLine(new VCFFilterHeaderLine(MQ0_RESCUE_FILTER_NAME, "Non-reference genotype called by HaplotypeCaller's MAPQ-0 rescue (--mq0-rescue): its alleles are carried by MAPQ-0 reads, which the regular calls leave out"));
         addFilterLine(new VCFFilterHeaderLine(VCFConstants.PASSES_FILTERS_v4, "Site contains at least one allele that passes filters"));
 
         addFilterLine(new VCFFilterHeaderLine(NAY_FROM_YNG, "Considered a NAY in the Yay, Nay, Grey table"));
@@ -148,6 +149,9 @@ public class GATKVCFHeaderLines {
         addInfoLine(new VCFInfoHeaderLine(MLE_ALLELE_COUNT_KEY, VCFHeaderLineCount.A, VCFHeaderLineType.Integer, "Maximum likelihood expectation (MLE) for the allele counts (not necessarily the same as the AC), for each ALT allele, in the same order as listed"));
         addInfoLine(new VCFInfoHeaderLine(MLE_ALLELE_FREQUENCY_KEY, VCFHeaderLineCount.A, VCFHeaderLineType.Float, "Maximum likelihood expectation (MLE) for the allele frequency (not necessarily the same as the AF), for each ALT allele, in the same order as listed"));
         addInfoLine(new VCFInfoHeaderLine(DOWNSAMPLED_KEY, 0, VCFHeaderLineType.Flag, "Were any of the samples downsampled?"));
+        addInfoLine(new VCFInfoHeaderLine(MQ0_RESCUE_KEY, 0, VCFHeaderLineType.Flag, "Record from HaplotypeCaller's MAPQ-0 rescue (--mq0-rescue)"));
+        addInfoLine(new VCFInfoHeaderLine(MQ0_RESCUE_DEPTH_KEY, 1, VCFHeaderLineType.Integer, "MAPQ-0 rescue record: depth at its start of the reads with MAPQ above 0 (DP1), that is the reads (not fragments) that passed HaplotypeCaller's read filters (so MAPQ at least --minimum-mapping-quality), the read stream's downsampling and the filters applied before genotyping (unclipped length, mate on the same contig, --keep-read-group)"));
+        addInfoLine(new VCFInfoHeaderLine(MQ0_RESCUE_MQ0_DEPTH_KEY, 1, VCFHeaderLineType.Integer, "MAPQ-0 rescue record: depth at its start of the MAPQ-0 reads (DP0), that is the reads (not fragments) with MAPQ 0 that passed HaplotypeCaller's other read filters, the per-alignment-start cap and the filters applied before genotyping (unclipped length, mate on the same contig, --keep-read-group)"));
         addInfoLine(new VCFInfoHeaderLine(BASE_QUAL_RANK_SUM_KEY, 1, VCFHeaderLineType.Float, "Z-score from Wilcoxon rank sum test of Alt Vs. Ref base qualities"));
         addInfoLine(new VCFInfoHeaderLine(AS_BASE_QUAL_RANK_SUM_KEY, VCFHeaderLineCount.A, VCFHeaderLineType.Float, "allele specific Z-score from Wilcoxon rank sum test of each Alt Vs. Ref base qualities"));
         addInfoLine(new VCFInfoHeaderLine(AS_RAW_BASE_QUAL_RANK_SUM_KEY, 1, VCFHeaderLineType.String, "raw data for allele specific rank sum test of base qualities"));

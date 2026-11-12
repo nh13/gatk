@@ -173,6 +173,13 @@ public final class GATKVCFConstants {
     // Collapse keys
     public static final String EXT_COLLAPSED_KEY =                  "XC";
 
+    // HaplotypeCaller MAPQ-0 rescue (--mq0-rescue) keys
+    public static final String MQ0_RESCUE_KEY =                     "MQ0R";
+    public static final String MQ0_RESCUE_DEPTH_KEY =               "MQ0R_DP1";
+    public static final String MQ0_RESCUE_MQ0_DEPTH_KEY =           "MQ0R_DP0";
+    // every INFO key of a MAPQ-0 rescue record
+    public static final List<String> MQ0_RESCUE_INFO_KEYS = List.of(MQ0_RESCUE_KEY, MQ0_RESCUE_DEPTH_KEY, MQ0_RESCUE_MQ0_DEPTH_KEY);
+
     //FILTERS
     /* Note that many filters used throughout GATK (most notably in VariantRecalibration) are dynamic,
        their names (or descriptions) depend on some threshold.  Those filters are not included here
@@ -180,6 +187,7 @@ public final class GATKVCFConstants {
     public static final String CLUSTERED_EVENTS_FILTER_NAME =                 "clustered_events"; //M2
     public static final String GERMLINE_RISK_FILTER_NAME =                    "germline"; //M2
     public static final String LOW_QUAL_FILTER_NAME =                         "LowQual";
+    public static final String MQ0_RESCUE_FILTER_NAME =                       "MQ0Rescue"; // HaplotypeCaller --mq0-rescue
     public static final String ALIGNMENT_ARTIFACT_FILTER_NAME =               "alignment";
     public static final String PON_FILTER_NAME =                              "panel_of_normals"; //M2
     public static final String POLYMERASE_SLIPPAGE =                          "slippage"; //M2
