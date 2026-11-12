@@ -17,6 +17,7 @@ import org.broadinstitute.hellbender.testutils.IntegrationTestSpec;
 import org.broadinstitute.hellbender.testutils.VariantContextTestUtils;
 import org.broadinstitute.hellbender.tools.walkers.genotyper.GenotypeCalculationArgumentCollection;
 import org.broadinstitute.hellbender.utils.variant.GATKVCFConstants;
+import org.broadinstitute.hellbender.utils.variant.GATKVariantContextUtils;
 import org.testng.Assert;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
@@ -833,5 +834,125 @@ public class ReblockGVCFIntegrationTest extends CommandLineProgramTest {
             }
         }
         Assert.assertTrue(foundNoCallSite);
+    }
+
+    // The hom-ref record at 13675306, which has deletion alleles, becomes a reference block to 13675330 that the later
+    // records split. The head and the tail of the split share one genotype PL array, and the head's PLs must not change
+    // when the tail's block lowers its own.
+    @Test
+    public void testSplitReferenceBlockKeepsItsPLs() {
+        final File input = getTestFile("reblockEdgeCase.vcf");
+        final File output = createTempFile("reblockedgvcf", ".vcf");
+        final ArgumentsBuilder args = new ArgumentsBuilder();
+
+        args.addReference(hg38Reference)
+                .add("V", input)
+                .add("drop-low-quals", true)
+                .add("do-qual-approx", true)
+                .addOutput(output);
+
+        runCommandLine(args);
+
+        final List<VariantContext> outVCs = VariantContextTestUtils.readEntireVCFIntoMemory(output.getAbsolutePath()).getRight();
+        final VariantContext head = outVCs.stream().filter(vc -> vc.getStart() == 13675306).findFirst()
+                .orElseThrow(() -> new AssertionError("no record at chr20:13675306"));
+        // The record's PLs for the reference and its most likely alternate allele, the 24-base deletion
+        Assert.assertEquals(head.getGenotype(0).getPL(), new int[]{0, 44, 673});
+        for (final VariantContext vc : outVCs) {
+            final Genotype g = vc.getGenotype(0);
+            if (ReblockGVCF.isHomRefBlock(vc) && g.hasPL()) {
+                Assert.assertEquals(g.getGQ(), GATKVariantContextUtils.calculateGQFromPLs(g.getPL()), vc.toString());
+            }
+        }
+    }
+
+    // Unsorted input would make the early flush write reference blocks that a later record should have trimmed
+    @DataProvider(name = "unsortedInputs")
+    public Object[][] unsortedInputs() {
+        return new Object[][]{
+                {"unsortedVariant.g.vcf", "chr20:1000700"},  // a SNP inside a reference block, after a later block
+                {"unsortedRefBlock.g.vcf", "chr20:1000500"}  // a reference block inside another, after a later block
+        };
+    }
+
+    @Test(dataProvider = "unsortedInputs")
+    public void testUnsortedInputIsAnError(final String inputName, final String outOfOrderPosition) {
+        final ArgumentsBuilder args = new ArgumentsBuilder().addReference(hg38Reference).add("V", getTestFile(inputName))
+                .addOutput(createTempFile("reblocked", ".g.vcf"));
+        // the walker wraps the exception
+        Throwable e = Assert.expectThrows(GATKException.class, () -> runCommandLine(args));
+        while (e != null && !(e instanceof UserException.BadInput)) {
+            e = e.getCause();
+        }
+        Assert.assertNotNull(e, "no UserException.BadInput");
+        Assert.assertTrue(e.getMessage().contains(outOfOrderPosition), e.getMessage());
+        Assert.assertTrue(e.getMessage().contains("coordinate-sorted"), e.getMessage());
+    }
+
+    // Inputs for checking that the early flush does not change the output, each with its reference. Between them they
+    // have reference blocks abutting and overlapping variants, deletions that run past the following records,
+    // low-quality deletions that become reference blocks, hom-ref records that become split reference blocks, records
+    // without PLs, more than one contig, and several inputs merged with records sharing a start.
+    private List<Pair<List<File>, String>> earlyFlushInputs() {
+        final List<Pair<List<File>, String>> inputs = new ArrayList<>();
+        for (final String name : Arrays.asList("overlappingDeletions.hc.g.vcf", "overlappingDels2.vcf", "dropGQ0Dels.g.vcf",
+                "prod.chr20snippet.withRawMQ.g.vcf", "prodWgsInput.g.vcf", "prodWesInput.g.vcf", "regressionTests.vcf",
+                "noCallGTs.g.vcf", "testLeftContigBoundary.g.vcf", "dragen.g.vcf", "reblockEdgeCase.vcf",
+                "HG002.snippet.g.vcf", "nonRefAD.g.vcf", "testFirstPositionOnContigNotDropped.g.vcf", "gvcfWithNoPRI.vcf",
+                "nonRefCall.vcf.gz", "alreadyReblocked.chr22snippet.vcf")) {
+            inputs.add(Pair.of(Collections.singletonList(getTestFile(name)), hg38Reference));
+        }
+        inputs.add(Pair.of(Collections.singletonList(getTestFile("reblock_cleanup_bug_variant.g.vcf")), pf_reference));
+        inputs.add(Pair.of(Arrays.asList(getTestFile("chr20.shard0.g.vcf"), getTestFile("chr20.shard1.g.vcf"),
+                getTestFile("chr20.shard2.g.vcf"), getTestFile("chr20.shard3.g.vcf")), hg38Reference));
+        return inputs;
+    }
+
+    /**
+     * Each input set from {@link #earlyFlushInputs()} with each of three argument sets, except with -drop-low-quals for
+     * the inputs that then write no records.
+     */
+    @DataProvider(name = "earlyFlushCases")
+    public Object[][] earlyFlushCases() {
+        final String dropLowQuals = " -drop-low-quals -do-qual-approx ";
+        final List<String> argSets = Arrays.asList("", WARP_PROD_REBLOCKING_ARGS, dropLowQuals);
+        // With -drop-low-quals these write no records, so the comparison would check nothing: all the records in them
+        // are no-calls with all-zero PLs
+        final Set<String> noRecordsWhenDroppingLowQuals = new HashSet<>(Arrays.asList("testLeftContigBoundary.g.vcf", "gvcfWithNoPRI.vcf"));
+        final List<Object[]> cases = new ArrayList<>();
+        for (final Pair<List<File>, String> inputs : earlyFlushInputs()) {
+            for (final String extraArgs : argSets) {
+                if (extraArgs.equals(dropLowQuals) && noRecordsWhenDroppingLowQuals.contains(inputs.getLeft().get(0).getName())) {
+                    continue;
+                }
+                cases.add(new Object[]{inputs.getLeft(), inputs.getRight(), extraArgs});
+            }
+        }
+        return cases.toArray(new Object[0][]);
+    }
+
+    // Flushing the reference blocks that end before each input record must not change the output
+    @Test(dataProvider = "earlyFlushCases")
+    public void testEarlyFlushDoesNotChangeOutput(final List<File> inputs, final String reference, final String extraArgs) throws IOException {
+        final List<String> withFlush = reblockLines(inputs, reference, extraArgs, true);
+        final List<String> withoutFlush = reblockLines(inputs, reference, extraArgs, false);
+        Assert.assertTrue(withFlush.stream().anyMatch(line -> !line.startsWith("#")), "no records in the output");
+        Assert.assertEquals(withFlush, withoutFlush);
+    }
+
+    /** @return the lines of the GVCF that ReblockGVCF writes for the inputs, with or without the early flush */
+    private List<String> reblockLines(final List<File> inputs, final String reference, final String extraArgs,
+                                      final boolean flushRefBlocksBeforeEachInput) throws IOException {
+        final File output = createTempFile("reblocked", ".g.vcf");
+        final ArgumentsBuilder args = new ArgumentsBuilder().addReference(reference).addOutput(output)
+                .add(StandardArgumentDefinitions.ADD_OUTPUT_VCF_COMMANDLINE, false);
+        inputs.forEach(input -> args.add("V", input));
+        if (!extraArgs.isBlank()) {
+            args.addRaw(extraArgs.trim());
+        }
+        final ReblockGVCF reblocker = new ReblockGVCF();
+        reblocker.flushRefBlocksBeforeEachInput = flushRefBlocksBeforeEachInput;
+        reblocker.instanceMain(args.getArgsArray());
+        return Files.readAllLines(output.toPath());
     }
 }

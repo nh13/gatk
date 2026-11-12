@@ -52,11 +52,12 @@ final class HomRefBlock extends GVCFBlock {
 
         this.ploidy = startingVC.getMaxPloidy(defaultPloidy);
         final Genotype g = startingVC.getGenotype(0);
-        if (g.hasPL()) {
-            this.minPLs = g.getPL();
-        }
+        final int[] pls = g.getPL();
+        this.minPLs = copyOf(pls);
         if (g.hasExtendedAttribute(GATKVCFConstants.PHRED_SCALED_POSTERIORS_KEY)) {
-            this.minPPs = PosteriorProbabilitiesUtils.parsePosteriorsIntoPhredSpace(g);
+            final int[] pps = PosteriorProbabilitiesUtils.parsePosteriorsIntoPhredSpace(g);
+            // missing posteriors are read as the genotype's PLs, and then track the block's PLs
+            this.minPPs = pps == pls ? minPLs : pps;
         }
         if (minPPs != null) {
             minGQ = GATKVariantContextUtils.calculateGQFromPLs(minPPs);
@@ -118,11 +119,12 @@ final class HomRefBlock extends GVCFBlock {
                     + this.getGQLowerBound() + ',' + this.getGQUpperBound() + ')');
         }
 
+        final int[] pls = genotype.getPL();
+        final boolean plsTakenFromThisGenotype = minPLs == null;
         if( minPLs == null ) {
-            minPLs = genotype.getPL();
+            minPLs = copyOf(pls);
         }
         else { // otherwise take the min with the provided genotype's PLs
-            final int[] pls = genotype.getPL();
             if (pls != null) {
                 if (pls.length != minPLs.length) {
                     throw new GATKException("trying to merge different PL array sizes: " + pls.length + " != " + minPLs.length);
@@ -134,11 +136,12 @@ final class HomRefBlock extends GVCFBlock {
         }
 
         if( genotype.hasExtendedAttribute(GATKVCFConstants.PHRED_SCALED_POSTERIORS_KEY)) {
+            final int[] pps = PosteriorProbabilitiesUtils.parsePosteriorsIntoPhredSpace(genotype);
             if (minPPs == null ) {
-                minPPs = PosteriorProbabilitiesUtils.parsePosteriorsIntoPhredSpace(genotype);
+                // missing posteriors are read as the genotype's PLs, and track the block's PLs if the block took them here
+                minPPs = pps != pls ? pps : plsTakenFromThisGenotype ? minPLs : copyOf(pps);
             }
             else { // otherwise take the min with the provided genotype's PLs
-                final int[] pps = PosteriorProbabilitiesUtils.parsePosteriorsIntoPhredSpace(genotype);
                 if (pps.length != minPPs.length) {
                     throw new GATKException("trying to merge different PP array sizes: " + pps.length + " != " + minPPs.length);
                 }
@@ -159,6 +162,15 @@ final class HomRefBlock extends GVCFBlock {
         if (genotype.hasDP()) {
             DPs.add(Math.max(genotype.getDP(), 0)); // DP must be >= 0
         }
+    }
+
+    /**
+     * The block lowers its minimum PLs and PPs in place, so it must own those arrays: a genotype's PL array is often
+     * shared with other genotypes ({@link GenotypeBuilder#GenotypeBuilder(Genotype)} keeps the same array), including
+     * those of records that are waiting to be written.
+     */
+    private static int[] copyOf(final int[] values) {
+        return values == null ? null : values.clone();
     }
 
     /** Get the min PLs observed within this band, can be null if no PLs have yet been observed */
