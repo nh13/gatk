@@ -145,7 +145,8 @@ public class VCFComparator extends MultiVariantWalkerGroupedByOverlap {
     private boolean ignoreSomeMultiAllelics = false;
 
     @Advanced
-    @Argument(fullName=ReblockGVCF.ANNOTATIONS_TO_KEEP_LONG_NAME, doc="Annotations that are not recognized by GATK that should be checked, otherwise they are removed if ignore-non-ref-data is set.", optional = true)
+    @Argument(fullName=ReblockGVCF.ANNOTATIONS_TO_KEEP_LONG_NAME, doc="Annotations that are not recognized by GATK that should be checked, otherwise they are removed if ignore-non-ref-data is set. " +
+            "The MAPQ-0 rescue INFO keys, which ReblockGVCF keeps, are always checked.", optional = true)
     private List<String> annotationsToKeep = new ArrayList<>();
 
     @Hidden
@@ -859,7 +860,9 @@ public class VCFComparator extends MultiVariantWalkerGroupedByOverlap {
                 variant.getAlleles(), orderedRelevantAlleles, null, GenotypeAssignmentMethod.BEST_MATCH_TO_ORIGINAL);
         vcBuilder.genotypes(gc);
 
-        final Map<String,Object> subsetAnnotations = ReblockGVCF.subsetAnnotationsIfNecessary(annotatorEngine, false, VCFConstants.GENOTYPE_POSTERIORS_KEY, variant, vcBuilder.make(), annotationsToKeep);
+        // the INFO annotations ReblockGVCF keeps: --annotations-to-keep and the MAPQ-0 rescue INFO keys
+        final Map<String,Object> subsetAnnotations = ReblockGVCF.subsetAnnotationsIfNecessary(annotatorEngine, false, VCFConstants.GENOTYPE_POSTERIORS_KEY, variant, vcBuilder.make(),
+                ReblockGVCF.withMq0RescueInfoKeys(annotationsToKeep));
 
         return variant.getGenotype(0).isHomRef() ? vcBuilder.make() : GATKVariantContextUtils.reverseTrimAlleles(vcBuilder.attributes(subsetAnnotations).make());
     }

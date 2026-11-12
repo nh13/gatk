@@ -398,6 +398,40 @@ public class ReblockGVCFUnitTest extends CommandLineProgramTest {
         Assert.assertEquals(subsetAnnotations.get(GATKVCFConstants.AS_RAW_RMS_MAPPING_QUALITY_KEY), "123769.00|46800.00|0.00");
     }
 
+    @Test
+    public void testAnnotationSubsettingKeepsMq0RescueKeys() {
+        // a record whose alleles regenotyping drops, as --drop-low-quals does: the INFO keys to keep (here the MAPQ-0
+        // rescue ones, as ReblockGVCF adds them) are copied to the subset record's annotations
+        final VariantAnnotatorEngine annotationEngine = new VariantAnnotatorEngine(Arrays.asList(new Coverage(), new RMSMappingQuality()),
+                null, Collections.emptyList(), false, false);
+        final Genotype g = VariantContextTestUtils.makeG("sample1", LONG_REF, LONG_SNP, 41, 0, 37, 200, 100, 200, 400, 600, 800, 1200, 5000, 5000, 5000, 5000, 5000);
+        final Map<String, Object> attributes = new LinkedHashMap<>();
+        attributes.put(VCFConstants.DEPTH_KEY, 93);
+        attributes.put(GATKVCFConstants.MQ0_RESCUE_KEY, true);
+        attributes.put(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY, 3);
+        attributes.put(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY, 90);
+        final VariantContext originalVC = new VariantContextBuilder(makeDeletionVC("", Arrays.asList(LONG_REF, LONG_SNP, DELETION, Allele.NON_REF_ALLELE),
+                LONG_REF.length(), g)).attributes(attributes).make();
+        final VariantContext regenotypedVC = makeDeletionVC("", Arrays.asList(LONG_REF, LONG_SNP, Allele.NON_REF_ALLELE), LONG_REF.length(),
+                VariantContextTestUtils.makeG("sample1", LONG_REF, LONG_SNP, 41, 0, 37, 200, 100, 200));
+        Assert.assertNotEquals(regenotypedVC.getNAlleles(), originalVC.getNAlleles());
+
+        final Map<String, Object> kept = ReblockGVCF.subsetAnnotationsIfNecessary(annotationEngine, true, null, originalVC, regenotypedVC,
+                ReblockGVCF.withMq0RescueInfoKeys(Collections.emptyList()));
+        Assert.assertEquals(kept.get(GATKVCFConstants.MQ0_RESCUE_KEY), true);
+        Assert.assertEquals(kept.get(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY), 3);
+        Assert.assertEquals(kept.get(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY), 90);
+        final Map<String, Object> dropped = ReblockGVCF.subsetAnnotationsIfNecessary(annotationEngine, true, null, originalVC, regenotypedVC,
+                Collections.emptyList());
+        GATKVCFConstants.MQ0_RESCUE_INFO_KEYS.forEach(key -> Assert.assertFalse(dropped.containsKey(key), key));
+    }
+
+    @Test
+    public void testWithMq0RescueInfoKeys() {
+        Assert.assertEquals(ReblockGVCF.withMq0RescueInfoKeys(List.of("A", GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY)),
+                List.of("A", GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY, GATKVCFConstants.MQ0_RESCUE_KEY, GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY));
+    }
+
     private GVCFWriter setUpWriter(final File outputFile, final File dictionary) throws IOException {
         final VariantContextWriterBuilder builder = new VariantContextWriterBuilder();
         builder.setOutputPath(outputFile.toPath());

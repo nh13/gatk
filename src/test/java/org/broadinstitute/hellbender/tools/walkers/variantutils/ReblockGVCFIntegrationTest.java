@@ -3,6 +3,10 @@ package org.broadinstitute.hellbender.tools.walkers.variantutils;
 import htsjdk.variant.variantcontext.Allele;
 import htsjdk.variant.variantcontext.Genotype;
 import htsjdk.variant.variantcontext.VariantContext;
+import htsjdk.variant.variantcontext.VariantContextBuilder;
+import htsjdk.variant.variantcontext.writer.Options;
+import htsjdk.variant.variantcontext.writer.VariantContextWriter;
+import htsjdk.variant.variantcontext.writer.VariantContextWriterBuilder;
 import htsjdk.variant.vcf.*;
 import org.apache.commons.lang3.tuple.Pair;
 import org.broadinstitute.hellbender.CommandLineProgramTest;
@@ -16,6 +20,10 @@ import org.broadinstitute.hellbender.testutils.CommandLineProgramTester;
 import org.broadinstitute.hellbender.testutils.IntegrationTestSpec;
 import org.broadinstitute.hellbender.testutils.VariantContextTestUtils;
 import org.broadinstitute.hellbender.tools.walkers.genotyper.GenotypeCalculationArgumentCollection;
+import org.broadinstitute.hellbender.tools.walkers.haplotypecaller.HaplotypeCaller;
+import org.broadinstitute.hellbender.tools.walkers.haplotypecaller.HaplotypeCallerArgumentCollection;
+import org.broadinstitute.hellbender.tools.walkers.haplotypecaller.Mq0RescueArgumentCollection;
+import org.broadinstitute.hellbender.utils.SimpleInterval;
 import org.broadinstitute.hellbender.utils.variant.GATKVCFConstants;
 import org.testng.Assert;
 import org.testng.annotations.DataProvider;
@@ -25,6 +33,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.util.*;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 public class ReblockGVCFIntegrationTest extends CommandLineProgramTest {
@@ -833,5 +842,279 @@ public class ReblockGVCFIntegrationTest extends CommandLineProgramTest {
             }
         }
         Assert.assertTrue(foundNoCallSite);
+    }
+
+    // HaplotypeCaller GVCFs of 20 kb of chromosome 21 where many of the NA12878 test BAM's reads have MAPQ 0, in DRAGEN
+    // mode (which the rescue requires), without and with --mq0-rescue, made once for the tests below. They are made by HaplotypeCaller rather than kept as files, so that
+    // they stay what HaplotypeCaller writes.
+    private static final String MQ0_RESCUE_INTERVAL = "21:10000000-10020000";
+    private static final String OTHER_FILTER = "OtherFilter";
+    private final Map<Boolean, File> mq0RescueGvcfs = new HashMap<>();
+    private final Map<List<String>, File> mq0RescueReblocked = new HashMap<>();
+    private Map<Integer, VariantContext> inputMq0Rescue = null;
+
+    private synchronized File mq0RescueGvcf(final boolean rescue) {
+        return mq0RescueGvcfs.computeIfAbsent(rescue, r -> {
+            final File gvcf = createTempFile("mq0Rescue." + r, ".g.vcf");
+            final ArgumentsBuilder args = new ArgumentsBuilder().addInput(NA12878_20_21_WGS_bam).addReference(b37_reference_20_21)
+                    .addInterval(MQ0_RESCUE_INTERVAL).addOutput(gvcf).add("ERC", "GVCF")
+                    .addFlag(HaplotypeCallerArgumentCollection.DRAGEN_3412_GATK_MODE_LONG_NAME);
+            if (r) {
+                args.addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME);
+            }
+            runCommandLine(args, HaplotypeCaller.class.getSimpleName());
+            return gvcf;
+        });
+    }
+
+    /** @return the reblocked GVCF, made once per input and arguments */
+    private synchronized File reblockMq0Rescue(final File gvcf, final String... extraArgs) {
+        final List<String> key = new ArrayList<>(List.of(gvcf.getAbsolutePath()));
+        key.addAll(List.of(extraArgs));
+        return mq0RescueReblocked.computeIfAbsent(key, k -> {
+            final File output = createTempFile("mq0Rescue.reblocked", ".g.vcf");
+            final ArgumentsBuilder args = new ArgumentsBuilder().addReference(b37_reference_20_21).add("V", gvcf).add("do-qual-approx", true)
+                    .add("floor-blocks", true).add("GQB", 20).add("GQB", 30).add("GQB", 40).addOutput(output);
+            for (int i = 0; i < extraArgs.length; i += 2) {
+                args.add(extraArgs[i], extraArgs[i + 1]);
+            }
+            runCommandLine(args);
+            return output;
+        });
+    }
+
+    private static boolean isMq0Rescue(final VariantContext vc) {
+        return vc.hasAttribute(GATKVCFConstants.MQ0_RESCUE_KEY);
+    }
+
+    private synchronized Map<Integer, VariantContext> inputMq0Rescue() {
+        if (inputMq0Rescue == null) {
+            inputMq0Rescue = VariantContextTestUtils.streamVcf(mq0RescueGvcf(true)).filter(ReblockGVCFIntegrationTest::isMq0Rescue)
+                    .collect(Collectors.toMap(VariantContext::getStart, vc -> vc));
+        }
+        return inputMq0Rescue;
+    }
+
+    /**
+     * Writes the rescue GVCF with its header lines and records changed.
+     *
+     * @param keepLine whether to keep a header line
+     * @param extraLines header lines to add
+     * @param rescueFilters the filters to give the rescue records
+     */
+    private File editedMq0RescueGvcf(final String name, final Predicate<VCFHeaderLine> keepLine, final Collection<VCFHeaderLine> extraLines,
+                                     final Set<String> rescueFilters) {
+        final Pair<VCFHeader, List<VariantContext>> input = VariantContextTestUtils.readEntireVCFIntoMemory(mq0RescueGvcf(true).getAbsolutePath());
+        final Set<VCFHeaderLine> lines = input.getLeft().getMetaDataInInputOrder().stream().filter(keepLine).collect(Collectors.toCollection(LinkedHashSet::new));
+        lines.addAll(extraLines);
+        final VCFHeader header = new VCFHeader(lines, input.getLeft().getGenotypeSamples());
+        final File output = createTempFile("mq0Rescue." + name, ".g.vcf");
+        try (final VariantContextWriter writer = new VariantContextWriterBuilder().setOutputFile(output).unsetOption(Options.INDEX_ON_THE_FLY)
+                .setOption(Options.ALLOW_MISSING_FIELDS_IN_HEADER).build()) {
+            writer.writeHeader(header);
+            for (final VariantContext vc : input.getRight()) {
+                writer.add(isMq0Rescue(vc) ? new VariantContextBuilder(vc).filters(new LinkedHashSet<>(rescueFilters)).make() : vc);
+            }
+        }
+        return output;
+    }
+
+    private static boolean isInfoLine(final VCFHeaderLine line, final String key) {
+        return line instanceof VCFInfoHeaderLine info && info.getID().equals(key);
+    }
+
+    private static boolean isFilterLine(final VCFHeaderLine line, final String name) {
+        return line instanceof VCFFilterHeaderLine filter && filter.getID().equals(name);
+    }
+
+    /** @return the variant records of a reblocked GVCF at the starts of the input's rescue records */
+    private List<VariantContext> atRescueStarts(final List<VariantContext> records) {
+        return records.stream().filter(vc -> !ReblockGVCF.isHomRefBlock(vc) && inputMq0Rescue().containsKey(vc.getStart())).collect(Collectors.toList());
+    }
+
+    /**
+     * Rescue records from HaplotypeCaller's --mq0-rescue keep their FILTER and INFO markers through reblocking, and the
+     * other variant records are those reblocking gives without rescue.
+     */
+    @Test
+    public void testMq0RescueMarkersKept() {
+        final Pair<VCFHeader, List<VariantContext>> out = VariantContextTestUtils.readEntireVCFIntoMemory(
+                reblockMq0Rescue(mq0RescueGvcf(true)).getAbsolutePath());
+        GATKVCFConstants.MQ0_RESCUE_INFO_KEYS.forEach(key -> Assert.assertTrue(out.getLeft().hasInfoLine(key), key));
+        Assert.assertNotNull(out.getLeft().getFilterHeaderLine(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME));
+
+        // every rescue record is kept, with its markers as they were
+        final Map<Integer, VariantContext> inputRescue = inputMq0Rescue();
+        Assert.assertTrue(inputRescue.size() >= 10);
+        final List<VariantContext> rescue = out.getRight().stream().filter(ReblockGVCFIntegrationTest::isMq0Rescue).collect(Collectors.toList());
+        Assert.assertEquals(rescue.stream().map(VariantContext::getStart).collect(Collectors.toSet()), inputRescue.keySet());
+        for (final VariantContext vc : rescue) {
+            Assert.assertEquals(vc.getFilters(), Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME), vc.toString());
+            for (final String key : GATKVCFConstants.MQ0_RESCUE_INFO_KEYS) {
+                Assert.assertEquals(vc.getAttribute(key), inputRescue.get(vc.getStart()).getAttribute(key), vc + " " + key);
+            }
+        }
+        // nothing else is filtered, and the other variant records are those reblocking gives without rescue, but for
+        // the regular non-calls that rescue records replaced: the markers change nothing else
+        final List<VariantContext> regular = out.getRight().stream().filter(vc -> !isMq0Rescue(vc) && !ReblockGVCF.isHomRefBlock(vc)).collect(Collectors.toList());
+        Assert.assertFalse(regular.isEmpty());
+        Assert.assertTrue(regular.stream().noneMatch(VariantContext::isFiltered));
+        final List<String> expected = VariantContextTestUtils.streamVcf(reblockMq0Rescue(mq0RescueGvcf(false)))
+                .filter(vc -> !ReblockGVCF.isHomRefBlock(vc) && inputRescue.values().stream().noneMatch(r -> r.overlaps(vc)))
+                .map(VariantContext::toStringWithoutGenotypes).collect(Collectors.toList());
+        Assert.assertEquals(regular.stream().map(VariantContext::toStringWithoutGenotypes).collect(Collectors.toList()), expected);
+    }
+
+    /**
+     * With --keep-site-filters the rescue records keep their other site filters along with the rescue filter, and the
+     * rescue filter is put back from the flag where it was cleared upstream.
+     */
+    @Test
+    public void testMq0RescueKeepSiteFilters() {
+        final VCFFilterHeaderLine otherFilterLine = new VCFFilterHeaderLine(OTHER_FILTER, "another site filter");
+        final File bothFilters = editedMq0RescueGvcf("bothFilters", line -> true, List.of(otherFilterLine),
+                Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME, OTHER_FILTER));
+        final File cleared = editedMq0RescueGvcf("rescueFilterCleared", line -> true, List.of(otherFilterLine), Set.of(OTHER_FILTER));
+        for (final File input : List.of(bothFilters, cleared)) {
+            final List<VariantContext> rescue = VariantContextTestUtils.streamVcf(reblockMq0Rescue(input, ReblockGVCF.KEEP_SITE_FILTERS_LONG_NAME, "true"))
+                    .filter(ReblockGVCFIntegrationTest::isMq0Rescue).collect(Collectors.toList());
+            Assert.assertEquals(rescue.stream().map(VariantContext::getStart).collect(Collectors.toSet()), inputMq0Rescue().keySet(), input.getName());
+            rescue.forEach(vc -> Assert.assertEquals(vc.getFilters(), Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME, OTHER_FILTER), vc.toString()));
+        }
+        // without --keep-site-filters, only the rescue filter
+        VariantContextTestUtils.streamVcf(reblockMq0Rescue(bothFilters)).filter(ReblockGVCFIntegrationTest::isMq0Rescue)
+                .forEach(vc -> Assert.assertEquals(vc.getFilters(), Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME), vc.toString()));
+    }
+
+    /**
+     * With --drop-low-quals, which regenotypes records and loses their filters, the rescue records that stay calls keep
+     * their markers: every variant record at the start of an input rescue record is one.
+     */
+    @Test
+    public void testMq0RescueDropLowQuals() {
+        final Map<Integer, VariantContext> inputRescue = inputMq0Rescue();
+        final List<VariantContext> atRescue = atRescueStarts(VariantContextTestUtils.streamVcf(reblockMq0Rescue(mq0RescueGvcf(true),
+                ReblockGVCF.DROP_LOW_QUALS_ARG_NAME, "true")).collect(Collectors.toList()));
+        Assert.assertFalse(atRescue.isEmpty());
+        for (final VariantContext vc : atRescue) {
+            Assert.assertTrue(isMq0Rescue(vc), vc.toString());
+            Assert.assertEquals(vc.getFilters(), Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME), vc.toString());
+            for (final String key : List.of(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY, GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY)) {
+                Assert.assertEquals(vc.getAttribute(key), inputRescue.get(vc.getStart()).getAttribute(key), vc + " " + key);
+            }
+        }
+    }
+
+    /**
+     * A rescue record that reblocking turns into a reference block (here, those whose reference genotype quality is below
+     * 55) loses its markers.
+     */
+    @Test
+    public void testMq0RescueDemoted() {
+        final List<VariantContext> out = VariantContextTestUtils.streamVcf(reblockMq0Rescue(mq0RescueGvcf(true),
+                ReblockGVCF.RGQ_THRESHOLD_LONG_NAME, "55")).collect(Collectors.toList());
+        final Map<Integer, VariantContext> inputRescue = inputMq0Rescue();
+        final Set<Integer> kept = out.stream().filter(ReblockGVCFIntegrationTest::isMq0Rescue).map(VariantContext::getStart).collect(Collectors.toSet());
+        final List<VariantContext> demoted = inputRescue.values().stream().filter(vc -> !kept.contains(vc.getStart())).collect(Collectors.toList());
+        Assert.assertFalse(kept.isEmpty());
+        Assert.assertFalse(demoted.isEmpty());
+        for (final VariantContext vc : demoted) {
+            final List<VariantContext> covering = out.stream().filter(o -> o.overlaps(new SimpleInterval(vc.getContig(), vc.getStart(), vc.getStart())))
+                    .collect(Collectors.toList());
+            Assert.assertFalse(covering.isEmpty(), vc.toString());
+            covering.forEach(o -> Assert.assertTrue(ReblockGVCF.isHomRefBlock(o) && !isMq0Rescue(o) && !o.isFiltered(), o.toString()));
+        }
+    }
+
+    /**
+     * With --add-site-filters-to-genotype, the genotype of a rescue record carries the filter in FT, also where the site
+     * filter was cleared upstream, and other genotypes carry no filter.
+     */
+    @Test
+    public void testMq0RescueFilterInGenotype() {
+        final File cleared = editedMq0RescueGvcf("genotypeFilterCleared", line -> true, Collections.emptyList(), Collections.emptySet());
+        for (final File input : List.of(mq0RescueGvcf(true), cleared)) {
+            final List<VariantContext> variants = VariantContextTestUtils.streamVcf(reblockMq0Rescue(input, ReblockGVCF.ADD_FILTERS_TO_GENOTYPE, "true"))
+                    .filter(vc -> !ReblockGVCF.isHomRefBlock(vc)).collect(Collectors.toList());
+            final List<VariantContext> atRescue = atRescueStarts(variants);
+            Assert.assertEquals(atRescue.size(), inputMq0Rescue().size(), input.getName());
+            atRescue.forEach(vc -> Assert.assertTrue(isMq0Rescue(vc), vc.toString()));
+            atRescue.forEach(vc -> Assert.assertEquals(vc.getGenotype(0).getFilters(), GATKVCFConstants.MQ0_RESCUE_FILTER_NAME, vc.toString()));
+            final List<VariantContext> regular = variants.stream().filter(vc -> !isMq0Rescue(vc)).collect(Collectors.toList());
+            Assert.assertFalse(regular.isEmpty());
+            regular.forEach(vc -> Assert.assertFalse(vc.getGenotype(0).isFiltered(), vc.toString()));
+        }
+    }
+
+    /**
+     * The filter header line is added when the input declares the rescue flag but not the filter (here, with the filter
+     * cleared upstream, which the flag puts back); an input without rescue header lines gets none; an input that
+     * declares none of the INFO keys is reblocked without markers; and one that declares the filter and the depths but
+     * not the flag keeps the depths, and the filter only as a site filter.
+     */
+    @Test
+    public void testMq0RescueHeaderLines() {
+        final File noFilter = editedMq0RescueGvcf("noFilterLine", line -> !isFilterLine(line, GATKVCFConstants.MQ0_RESCUE_FILTER_NAME),
+                Collections.emptyList(), Collections.emptySet());
+        final Pair<VCFHeader, List<VariantContext>> refiltered = VariantContextTestUtils.readEntireVCFIntoMemory(reblockMq0Rescue(noFilter).getAbsolutePath());
+        Assert.assertNotNull(refiltered.getLeft().getFilterHeaderLine(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME));
+        final List<VariantContext> refilteredRescue = refiltered.getRight().stream().filter(ReblockGVCFIntegrationTest::isMq0Rescue).collect(Collectors.toList());
+        Assert.assertEquals(refilteredRescue.stream().map(VariantContext::getStart).collect(Collectors.toSet()), inputMq0Rescue().keySet());
+        refilteredRescue.forEach(vc -> Assert.assertEquals(vc.getFilters(), Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME), vc.toString()));
+        Assert.assertTrue(refiltered.getRight().stream().filter(vc -> !isMq0Rescue(vc)).noneMatch(VariantContext::isFiltered));
+
+        final VCFHeader plain = VariantContextTestUtils.readEntireVCFIntoMemory(reblockMq0Rescue(mq0RescueGvcf(false)).getAbsolutePath()).getLeft();
+        GATKVCFConstants.MQ0_RESCUE_INFO_KEYS.forEach(key -> Assert.assertFalse(plain.hasInfoLine(key), key));
+        Assert.assertNull(plain.getFilterHeaderLine(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME));
+
+        final File noInfo = editedMq0RescueGvcf("noInfoLines", line -> GATKVCFConstants.MQ0_RESCUE_INFO_KEYS.stream().noneMatch(key -> isInfoLine(line, key)),
+                Collections.emptyList(), Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME));
+        final List<VariantContext> unmarked = VariantContextTestUtils.streamVcf(reblockMq0Rescue(noInfo)).collect(Collectors.toList());
+        Assert.assertTrue(unmarked.stream().noneMatch(vc -> isMq0Rescue(vc) || vc.isFiltered()));
+
+        final File noFlag = editedMq0RescueGvcf("noFlagLine", line -> !isInfoLine(line, GATKVCFConstants.MQ0_RESCUE_KEY),
+                Collections.emptyList(), Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME));
+        for (final boolean keepFilters : new boolean[]{false, true}) {
+            final List<VariantContext> atRescue = atRescueStarts(VariantContextTestUtils.streamVcf(
+                    reblockMq0Rescue(noFlag, ReblockGVCF.KEEP_SITE_FILTERS_LONG_NAME, String.valueOf(keepFilters))).collect(Collectors.toList()));
+            Assert.assertEquals(atRescue.size(), inputMq0Rescue().size());
+            for (final VariantContext vc : atRescue) {
+                Assert.assertFalse(isMq0Rescue(vc), vc.toString());
+                Assert.assertEquals(vc.getAttribute(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY), inputMq0Rescue().get(vc.getStart()).getAttribute(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY), vc.toString());
+                Assert.assertEquals(vc.getAttribute(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY), inputMq0Rescue().get(vc.getStart()).getAttribute(GATKVCFConstants.MQ0_RESCUE_DEPTH_KEY), vc.toString());
+                Assert.assertEquals(vc.getFilters(), keepFilters ? Set.of(GATKVCFConstants.MQ0_RESCUE_FILTER_NAME) : Collections.emptySet(), vc.toString());
+            }
+        }
+    }
+
+    /**
+     * VCFComparator compares the MAPQ-0 rescue INFO keys of records whose uncalled alleles it trims, as ReblockGVCF
+     * keeps them, without --annotations-to-keep.
+     */
+    @Test
+    public void testMq0RescueKeysComparedByVCFComparator() throws IOException {
+        // a rescue record with an uncalled alternate allele, so that the comparator subsets its alleles
+        final VariantContext multiallelic = inputMq0Rescue().values().stream()
+                .filter(vc -> vc.getAlternateAlleles().stream().filter(a -> !a.isSymbolic()).count() > 1)
+                .min(Comparator.comparingInt(VariantContext::getStart)).orElse(null);
+        Assert.assertNotNull(multiallelic);
+        final int depth = multiallelic.getAttributeAsInt(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY, -1);
+        final String position = multiallelic.getContig() + "\t" + multiallelic.getStart() + "\t";
+        final String from = GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY + "=" + depth + ";";
+        final File changed = createTempFile("mq0Rescue.changedDepth", ".g.vcf");
+        final List<String> lines = Files.readAllLines(mq0RescueGvcf(true).toPath());
+        Assert.assertEquals(lines.stream().filter(line -> line.startsWith(position) && line.contains(from)).count(), 1);
+        Files.write(changed.toPath(), lines.stream()
+                .map(line -> line.startsWith(position) ? line.replace(from, GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY + "=" + (depth + 50) + ";") : line)
+                .collect(Collectors.toList()));
+        for (final boolean differ : new boolean[]{false, true}) {
+            final File warnings = createTempFile("mq0Rescue.comparator." + differ, ".txt");
+            runCommandLine(new ArgumentsBuilder().addReference(b37_reference_20_21)
+                    .addRaw("-V:actual").addRaw((differ ? changed : mq0RescueGvcf(true)).getAbsolutePath())
+                    .addRaw("-V:expected").addRaw(mq0RescueGvcf(true).getAbsolutePath())
+                    .add("output-warnings", warnings).addFlag("warn-on-errors"), VCFComparator.class.getSimpleName());
+            final String text = Files.readString(warnings.toPath());
+            Assert.assertEquals(text.contains(GATKVCFConstants.MQ0_RESCUE_MQ0_DEPTH_KEY), differ, text);
+        }
     }
 }
