@@ -34,4 +34,16 @@ public class Mq0RescueArgumentCollectionUnitTest extends GATKBaseTest {
             Assert.assertNotNull(parse().getNamedArgumentDefinitionByAlias(name), name);
         }
     }
+
+    @Test
+    public void testGivenInjectOnlyArguments() {
+        final CommandLineArgumentParser parser = parse("--" + Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME, "ASSEMBLE",
+                "--" + Mq0RescueArgumentCollection.MQ0_RESCUE_MAX_EVENT_SETS_LONG_NAME, "2",
+                "--" + Mq0RescueArgumentCollection.MQ0_RESCUE_DISTANCE_LONG_NAME, "20");
+        Assert.assertEquals(Mq0RescueArgumentCollection.givenInjectOnlyArguments(parser), List.of(Mq0RescueArgumentCollection.MQ0_RESCUE_MAX_EVENT_SETS_LONG_NAME));
+        // every INJECT-only argument is a rescue-only argument too, and so is the mode
+        Assert.assertTrue(Mq0RescueArgumentCollection.RESCUE_ONLY_ARGUMENTS.containsAll(Mq0RescueArgumentCollection.INJECT_ONLY_ARGUMENTS));
+        Assert.assertEquals(Mq0RescueArgumentCollection.givenRescueOnlyArguments(parser), List.of(Mq0RescueArgumentCollection.MQ0_RESCUE_DISTANCE_LONG_NAME,
+                Mq0RescueArgumentCollection.MQ0_RESCUE_MAX_EVENT_SETS_LONG_NAME, Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME));
+    }
 }

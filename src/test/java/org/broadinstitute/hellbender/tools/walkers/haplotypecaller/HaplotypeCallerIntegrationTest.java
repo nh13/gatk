@@ -2819,7 +2819,8 @@ public class HaplotypeCallerIntegrationTest extends CommandLineProgramTest {
         return new Object[][]{
                 {List.of("--" + HaplotypeCallerArgumentCollection.DRAGEN_378_GATK_MODE_LONG_NAME), 1},
                 {List.of("--" + PileupDetectionArgumentCollection.PILEUP_DETECTION_LONG_NAME), 1},
-                {List.of("--" + AssemblyBasedCallerArgumentCollection.MAX_MNP_DISTANCE_LONG_NAME, "2"), 1}};
+                {List.of("--" + AssemblyBasedCallerArgumentCollection.MAX_MNP_DISTANCE_LONG_NAME, "2"), 1},
+                {List.of("--" + Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME, "ASSEMBLE", "--" + PileupDetectionArgumentCollection.PILEUP_DETECTION_LONG_NAME), 1}};
     }
 
     @Test(dataProvider = "mq0RescueOptions")
@@ -3015,6 +3016,73 @@ public class HaplotypeCallerIntegrationTest extends CommandLineProgramTest {
         final File again = createTempFile("mq0Rescue.again", ".g.vcf");
         runCommandLine(mq0RescueArgs(again, ReferenceConfidenceMode.GVCF).addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME));
         IntegrationTestSpec.assertEqualTextFiles(again, mq0RescueRun(ReferenceConfidenceMode.GVCF, true));
+    }
+
+    /**
+     * ASSEMBLE mode makes rescue records INJECT cannot (here, a SNP that INJECT does not insert), with the same
+     * guarantees, in every reference-confidence mode (all in DRAGEN mode, which the rescue requires): non-reference calls whose alleles MAPQ-0 reads carry, overlapping
+     * no regular call. Its assemblies add nothing to the side outputs: the rescue assembler writes nothing to the
+     * haplotype histogram, and rescue calls nothing to the assembled-variants output or the bamout. (The assembly graph
+     * output names vertices by object identity, so it differs from run to run and is not compared.) The same run gives
+     * the same output, and --mq0-rescue-max-event-sets changes nothing in ASSEMBLE mode.
+     */
+    @Test
+    public void testMq0RescueAssemble() throws IOException {
+        final Map<Boolean, File> outputs = new HashMap<>();
+        final Map<Boolean, List<File>> sideOutputs = new HashMap<>();
+        for (final boolean assemble : new boolean[]{false, true}) {
+            outputs.put(assemble, createTempFile("mq0Rescue.assemble." + assemble, ".g.vcf"));
+            sideOutputs.put(assemble, List.of(createTempFile("mq0Rescue.assembledVariants." + assemble, ".vcf"),
+                    createTempFile("mq0Rescue.histogram." + assemble, ".txt"), createTempFile("mq0Rescue.bamout." + assemble, ".bam")));
+            final ArgumentsBuilder args = mq0RescueArgs(outputs.get(assemble), ReferenceConfidenceMode.GVCF)
+                    .add(ReadThreadingAssemblerArgumentCollection.DEBUG_ASSEMBLY_VARIANTS_OUT_LONG_NAME, sideOutputs.get(assemble).get(0))
+                    .add(ReadThreadingAssemblerArgumentCollection.HAPLOTYPE_DEBUG_HISTOGRAM_OUTPUT_LONG_NAME, sideOutputs.get(assemble).get(1))
+                    .add(AssemblyBasedCallerArgumentCollection.BAM_OUTPUT_LONG_NAME, sideOutputs.get(assemble).get(2));
+            if (assemble) {
+                args.addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME).add(Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME, Mq0RescueArgumentCollection.Mode.ASSEMBLE);
+            }
+            runCommandLine(args);
+        }
+        final File assembled = outputs.get(true);
+        final List<VariantContext> assembleRescue = assertMq0RescueOutput(mq0RescueRun(ReferenceConfidenceMode.GVCF, false), assembled, ReferenceConfidenceMode.GVCF);
+        final Set<Integer> injectStarts = VariantContextTestUtils.streamVcf(mq0RescueRun(ReferenceConfidenceMode.GVCF, true))
+                .filter(HaplotypeCallerIntegrationTest::isMq0RescueRecord).map(VariantContext::getStart).collect(Collectors.toSet());
+        final VariantContext assembleOnly = assembleRescue.stream().filter(vc -> vc.getStart() == 10007110).findFirst().orElse(null);
+        Assert.assertNotNull(assembleOnly);
+        Assert.assertFalse(injectStarts.contains(10007110));
+        Assert.assertEquals(assembleOnly.getReference().getBaseString(), MQ0_RESCUE_ASSEMBLE_ONLY_REF, assembleOnly.toString());
+        Assert.assertTrue(assembleOnly.getGenotype(0).isHet() && assembleOnly.getGenotype(0).getAlleles().stream()
+                .anyMatch(a -> a.getBaseString().equals(MQ0_RESCUE_ASSEMBLE_ONLY_ALT)), assembleOnly.toString());
+        Assert.assertTrue(assembleOnly.getPhredScaledQual() >= 15, assembleOnly.toString());
+
+        Assert.assertEquals(dataLines(sideOutputs.get(true).get(0)), dataLines(sideOutputs.get(false).get(0)));
+        IntegrationTestSpec.assertEqualTextFiles(sideOutputs.get(true).get(1), sideOutputs.get(false).get(1));
+        final List<String> bamout = samRecords(sideOutputs.get(true).get(2));
+        Assert.assertFalse(bamout.isEmpty());
+        Assert.assertEquals(bamout, samRecords(sideOutputs.get(false).get(2)));
+
+        final File again = createTempFile("mq0Rescue.assemble.again", ".g.vcf");
+        runCommandLine(mq0RescueArgs(again, ReferenceConfidenceMode.GVCF).addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME)
+                .add(Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME, Mq0RescueArgumentCollection.Mode.ASSEMBLE)
+                .add(Mq0RescueArgumentCollection.MQ0_RESCUE_MAX_EVENT_SETS_LONG_NAME, 0));
+        IntegrationTestSpec.assertEqualTextFiles(again, assembled);
+
+        for (final ReferenceConfidenceMode mode : List.of(ReferenceConfidenceMode.NONE, ReferenceConfidenceMode.BP_RESOLUTION)) {
+            final File output = createTempFile("mq0Rescue.assemble." + mode, ".vcf");
+            runCommandLine(mq0RescueArgs(output, mode).addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME)
+                    .add(Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME, Mq0RescueArgumentCollection.Mode.ASSEMBLE));
+            assertMq0RescueOutput(mq0RescueRun(mode, false), output, mode);
+        }
+    }
+
+    // the SNP at 10007110 that ASSEMBLE mode rescues and INJECT mode does not insert
+    private static final String MQ0_RESCUE_ASSEMBLE_ONLY_REF = "A";
+    private static final String MQ0_RESCUE_ASSEMBLE_ONLY_ALT = "G";
+
+    @Test(expectedExceptions = CommandLineException.class, expectedExceptionsMessageRegExp = ".*mq0-rescue-mode.*must be INJECT or ASSEMBLE.*")
+    public void testMq0RescueRejectsNullMode() {
+        runCommandLine(mq0RescueArgs(createTempFile("mq0Rescue", ".g.vcf"), ReferenceConfidenceMode.GVCF)
+                .addFlag(Mq0RescueArgumentCollection.MQ0_RESCUE_LONG_NAME).add(Mq0RescueArgumentCollection.MQ0_RESCUE_MODE_LONG_NAME, "null"));
     }
 
     /**
