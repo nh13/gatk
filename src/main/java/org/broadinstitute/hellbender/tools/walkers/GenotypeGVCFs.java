@@ -37,6 +37,8 @@ import org.broadinstitute.hellbender.utils.IntervalMergingRule;
 import org.broadinstitute.hellbender.utils.IntervalSetRule;
 import org.broadinstitute.hellbender.utils.IntervalUtils;
 import org.broadinstitute.hellbender.utils.SimpleInterval;
+import org.broadinstitute.hellbender.utils.io.IOUtils;
+import org.broadinstitute.hellbender.utils.variant.GATKVCFConstants;
 import org.broadinstitute.hellbender.utils.variant.GATKVariantContextUtils;
 import org.broadinstitute.hellbender.tools.walkers.annotator.allelespecific.ReducibleAnnotation;
 import org.broadinstitute.hellbender.utils.variant.writers.IntervalFilteringVcfWriter;
@@ -101,6 +103,34 @@ import static org.broadinstitute.hellbender.utils.variant.writers.IntervalFilter
  *   <li>The amount of temporary disk storage required by GenomicsDBImport may exceed what is available in the default location: `/tmp`. The command line argument `--tmp-dir` can be used to specify an alternate temperary storage location with sufficient space.</li>
  * </ul>
  *
+ * <h3>Using the genotype priors in the input</h3>
+ * <p>HaplotypeCaller assigns genotypes from posteriors when run with {@code --genotype-assignment-method USE_POSTERIOR_PROBABILITIES}
+ * (as in {@code --dragen-mode}), using genotype priors such as the DRAGstr STR priors, and writes each sample's priors to the
+ * GVCF as FORMAT PG (Illumina DRAGEN writes them as PRI). By default this tool ignores them and assigns genotypes from the
+ * likelihoods alone. With {@code --use-input-genotype-priors} it recomputes each sample's posteriors from its likelihoods
+ * and its own priors, and assigns GT, GQ, GP and PG from them. GP and PG in the output then come only from this
+ * calculation: samples that keep their likelihood-based genotype have none, and PRI is not written.</p>
+ * <ul>
+ *   <li>A sample's priors are used only where they apply exactly: at a site starting where the sample's record started,
+ *   whose alleles are all alleles of that record. At a site with an allele the sample's record did not have (e.g. another
+ *   sample's allele, which that sample's {@code <NON_REF>} stands for) or a deletion spanning from an earlier record, the
+ *   sample keeps its likelihood-based genotype. Reference blocks carry no priors.</li>
+ *   <li>The site QUAL is computed from the posteriors only when every sample with informative likelihoods got posteriors;
+ *   otherwise it is computed as usual from the likelihoods. Which alleles are kept, and the LowQual filter, are decided
+ *   from the likelihood-based QUAL as usual, so the calls are not guaranteed to match HaplotypeCaller's. If the priors
+ *   leave no sample with an alternate allele, the site is written only with {@code --include-non-variant-sites}.</li>
+ *   <li>The priors of a single-sample GVCF are taken as written for each record, provided they fit it: one per genotype,
+ *   and, where the record has GP, GP equal to PL plus the priors. Priors that do not fit (as when a sample is taken out
+ *   of a combined GVCF, whose PL was remapped but whose PG and GP were not) are not used, with a warning. A reordering
+ *   that leaves PL unchanged, or a record without GP, cannot be detected this way, so use GVCFs as written by the caller.</li>
+ *   <li>For a cohort, combine the GVCFs with {@code CombineGVCFs --preserve-genotype-priors} or import them with
+ *   {@code GenomicsDBImport --preserve-genotype-priors}, which record each sample's priors with the alleles they were
+ *   written for (FORMAT {@value GATKVCFConstants#GENOTYPE_PRIOR_PROVENANCE_KEY}). Priors in multi-sample input, or in
+ *   any GenomicsDB workspace, without that record are not used, with a warning.</li>
+ *   <li>Records whose priors were dropped upstream (for example by ReblockGVCF, which removes them when it changes alleles)
+ *   keep their likelihood-based genotypes.</li>
+ * </ul>
+ *
  * <h3>Special note on ploidy</h3>
  * <p>This tool is able to handle any ploidy (or mix of ploidies) intelligently; there is no need to specify ploidy
  * for non-diploid organisms.</p>
@@ -115,6 +145,7 @@ public final class GenotypeGVCFs extends VariantLocusWalker {
     public static final String PHASED_HOM_VAR_STRING = "1|1";
     public static final String ONLY_OUTPUT_CALLS_STARTING_IN_INTERVALS_FULL_NAME = "only-output-calls-starting-in-intervals";
     public static final String ALL_SITES_LONG_NAME = "include-non-variant-sites";
+    public static final String USE_INPUT_GENOTYPE_PRIORS_LONG_NAME = "use-input-genotype-priors";
     public static final String ALL_SITES_SHORT_NAME = "all-sites";
     public static final String KEEP_COMBINED_LONG_NAME = "keep-combined-raw-annotations";
     public static final String KEEP_COMBINED_SHORT_NAME = "keep-combined";
@@ -176,6 +207,15 @@ public final class GenotypeGVCFs extends VariantLocusWalker {
 
     @ArgumentCollection
     private GenotypeCalculationArgumentCollection genotypeArgs = new GenotypeCalculationArgumentCollection();
+
+    /**
+     * Assign genotypes from posteriors computed with each sample's own genotype priors from the input (PG, or PRI from
+     * Illumina DRAGEN), where they apply, and compute the site QUAL from those posteriors when every sample with
+     * informative likelihoods has them. See "Using the genotype priors in the input" above.
+     */
+    @Argument(fullName = USE_INPUT_GENOTYPE_PRIORS_LONG_NAME, optional = true,
+            doc = "Assign genotypes from posteriors using each sample's genotype priors (PG or PRI) from the input where they apply")
+    private boolean useInputGenotypePriors = false;
 
     @ArgumentCollection
     private GenomicsDBArgumentCollection genomicsdbArgs = new GenomicsDBArgumentCollection();
@@ -280,6 +320,10 @@ public final class GenotypeGVCFs extends VariantLocusWalker {
 
         forceOutputIntervalsPresent = !forceOutputIntervalStrings.isEmpty();
 
+        if (useInputGenotypePriors) {
+            validateInputGenotypePriorArguments();
+        }
+
         if (includeNonVariants && forceOutputIntervalsPresent ) {
             throw new CommandLineException.BadArgumentValue(String.format("Force output (--%s) is incompatible with including " +
                     "non-variants (--%s and --%s).  Use the latter to force genotyping at all sites and the former to force genotyping only at given sites." +
@@ -309,10 +353,18 @@ public final class GenotypeGVCFs extends VariantLocusWalker {
 
         //create engine object
         final boolean   keepSB = variantAnnotations.stream().map(a -> a.getClass().getSimpleName()).collect(Collectors.toList()).contains(StrandBiasBySample.class.getSimpleName());
-        gvcfEngine = new GenotypeGVCFsEngine(annotationEngine, genotypeArgs, includeNonVariants, inputVCFHeader, keepSB);
+        gvcfEngine = new GenotypeGVCFsEngine(annotationEngine, genotypeArgs, includeNonVariants, inputVCFHeader, keepSB,
+                useInputGenotypePriors, !IOUtils.isGenomicsDBPath(drivingVariantFile));
 
         //call initialize method in engine class that creates VCFWriter object and writes a header to it
         vcfWriter = gvcfEngine.setupVCFWriter(defaultToolVCFHeaderLines, keepCombined, dbsnp, vcfWriter);
+    }
+
+    private void validateInputGenotypePriorArguments() {
+        if (somaticInput) {
+            throw new CommandLineException.BadArgumentValue(String.format("--%s cannot be used with --%s: somatic GVCFs have no genotype priors",
+                    USE_INPUT_GENOTYPE_PRIORS_LONG_NAME, CombineGVCFs.SOMATIC_INPUT_LONG_NAME));
+        }
     }
 
     private Set<Annotation> getAnnotationsToKeep() {
@@ -342,6 +394,9 @@ public final class GenotypeGVCFs extends VariantLocusWalker {
 
     @Override
     public void closeTool() {
+        if (gvcfEngine != null) {
+            gvcfEngine.logInputGenotypePriorSummary();
+        }
         if ( vcfWriter != null) {
             vcfWriter.close();
         }

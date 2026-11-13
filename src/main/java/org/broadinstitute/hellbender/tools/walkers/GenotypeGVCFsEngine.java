@@ -45,7 +45,7 @@ public class GenotypeGVCFsEngine
     private VariantAnnotatorEngine annotationEngine = null;
 
     //the genotyping engine
-    private GenotypingEngine<?> forceOutputGenotypingEngine = null;
+    private MinimalGenotypingEngine forceOutputGenotypingEngine = null;
     private MinimalGenotypingEngine genotypingEngine = null;
 
     // the INFO field annotation key names to remove
@@ -68,6 +68,19 @@ public class GenotypeGVCFsEngine
 
     final boolean   keepSB;
 
+    // FORMAT fields never written: PG_SRC only carries input priors between tools
+    private static final Set<String> OUTPUT_EXCLUDED_FORMAT_KEYS = Set.of(GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY);
+
+    // FORMAT fields not written when genotypes are assigned from input priors, which recomputes GP and PG
+    private static final Set<String> OUTPUT_EXCLUDED_FORMAT_KEYS_WITH_INPUT_PRIORS = Set.of(GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY,
+            GATKVCFConstants.DRAGEN_GENOTYPE_PRIOR_KEY);
+
+    // assigns genotypes from each sample's input genotype priors; null unless requested
+    private final InputGenotypePriors inputGenotypePriors;
+
+    // records the provenance of input records' priors before merging; null unless input genotype priors were requested
+    private final GenotypePriorProvenanceRecorder provenanceRecorder;
+
     /**
      * Create and initialize a new GenotypeGVCFsEngine given a collection of GenotypeGVCF arguments and a VCF header
      *  @param annotationEngine variantAnnotatorEngine with annotations to process already added
@@ -79,11 +92,38 @@ public class GenotypeGVCFsEngine
     public GenotypeGVCFsEngine(final VariantAnnotatorEngine annotationEngine, final GenotypeCalculationArgumentCollection genotypeArgs,
                                final boolean includeNonVariants, final VCFHeader inputVCFHeader, final boolean keepSB)
     {
+        this(annotationEngine, genotypeArgs, includeNonVariants, inputVCFHeader, keepSB, false, false);
+    }
+
+    /**
+     * Create and initialize a new GenotypeGVCFsEngine given a collection of GenotypeGVCF arguments and a VCF header
+     *  @param annotationEngine variantAnnotatorEngine with annotations to process already added
+     * @param genotypeArgs command-line arguments for the GenotypeGVCFs caller
+     * @param includeNonVariants true to save INFO header names that require alt alleles
+     * @param inputVCFHeader header for the VCF
+     * @param keepSB keep SB attribute (STRAND_BIAS_BY_SAMPLE)
+     * @param useInputGenotypePriors assign genotypes (and, where every informative sample allows it, QUAL) from posteriors
+     *                               with each sample's own input genotype priors; see {@link InputGenotypePriors}
+     * @param trustSingleSamplePriors whether the PG/PRI of a single-sample input record without
+     *                                {@value GATKVCFConstants#GENOTYPE_PRIOR_PROVENANCE_KEY} may be taken as written for
+     *                                that record; false when the input records were produced by merging (e.g. GenomicsDB)
+     */
+    public GenotypeGVCFsEngine(final VariantAnnotatorEngine annotationEngine, final GenotypeCalculationArgumentCollection genotypeArgs,
+                               final boolean includeNonVariants, final VCFHeader inputVCFHeader, final boolean keepSB,
+                               final boolean useInputGenotypePriors, final boolean trustSingleSamplePriors)
+    {
         this.annotationEngine = annotationEngine;
         this.genotypeArgs = genotypeArgs;
         this.includeNonVariants = includeNonVariants;
         this.inputVCFHeader = inputVCFHeader;
         this.keepSB = keepSB;
+        this.inputGenotypePriors = useInputGenotypePriors ? new InputGenotypePriors() : null;
+        this.provenanceRecorder = !useInputGenotypePriors ? null : new GenotypePriorProvenanceRecorder(trustSingleSamplePriors,
+                trustSingleSamplePriors ? String.format("To use the priors of several samples, combine their single-sample GVCFs " +
+                                "with CombineGVCFs --%s.", GenotypePriorProvenanceRecorder.PRESERVE_GENOTYPE_PRIORS_LONG_NAME)
+                        : String.format("To use the priors, import the single-sample GVCFs with GenomicsDBImport --%s.",
+                                GenotypePriorProvenanceRecorder.PRESERVE_GENOTYPE_PRIORS_LONG_NAME),
+                logger);
         initialize();
     }
 
@@ -108,6 +148,8 @@ public class GenotypeGVCFsEngine
                 annotationEngine.getInfoAnnotations().stream().anyMatch(AnnotationUtils::isAlleleSpecific), this.dragStrParams);
         forceOutputGenotypingEngine = new MinimalGenotypingEngine(createMinimalArgs(true), samples,
                 annotationEngine.getInfoAnnotations().stream().anyMatch(AnnotationUtils::isAlleleSpecific));
+        genotypingEngine.setInputGenotypePriors(inputGenotypePriors);
+        forceOutputGenotypingEngine.setInputGenotypePriors(inputGenotypePriors);
 
         if ( includeNonVariants ) {
             // Save INFO header names that require alt alleles
@@ -125,7 +167,8 @@ public class GenotypeGVCFsEngine
                                      ReferenceConfidenceVariantContextMerger merger, boolean somaticInput, double tlodThreshold,
                                      double sqThreshold, double afTolerance, final boolean outputNonVariants) //do work for apply
     {
-        final List<VariantContext> variantsToProcess = getVariantSubsetToProcess(loc, variants);
+        final List<VariantContext> variantsToProcess = provenanceRecorder == null ? getVariantSubsetToProcess(loc, variants)
+                : withGenotypePriorProvenance(loc, getVariantSubsetToProcess(loc, variants));
 
         if (dragStrParams == null || genotypeArgs.dontUseDragstrPriors) {
             ref.setWindow(10, 10); //TODO this matches the gatk3 behavior but may be unnecessary
@@ -133,11 +176,56 @@ public class GenotypeGVCFsEngine
             ref.setWindow(dragStrParams.maximumLengthInBasePairs(), dragStrParams.maximumLengthInBasePairs());
         }
         genotypingEngine.setReferenceContext(ref);
-        final VariantContext mergedVC = merger.merge(variantsToProcess, loc, ref.getBase(), true, false);
+        final VariantContext merged = merger.merge(variantsToProcess, loc, ref.getBase(), true, false);
+        // PG_SRC only carries input priors to the genotyper: drop it before genotyping unless they are used, and from the
+        // output; with them, PRI is not written either (GP and PG are recomputed where the priors apply)
+        final VariantContext mergedVC = inputGenotypePriors == null ? withoutFormatFields(merged, OUTPUT_EXCLUDED_FORMAT_KEYS) : merged;
         final VariantContext regenotypedVC = somaticInput ? regenotypeSomaticVC(mergedVC, ref, features, outputNonVariants, tlodThreshold, sqThreshold, afTolerance) :
                 regenotypeVC(mergedVC, ref, features, outputNonVariants);
 
-        return regenotypedVC;
+        return regenotypedVC == null ? null : withoutFormatFields(regenotypedVC,
+                inputGenotypePriors == null ? OUTPUT_EXCLUDED_FORMAT_KEYS : OUTPUT_EXCLUDED_FORMAT_KEYS_WITH_INPUT_PRIORS);
+    }
+
+    /**
+     * Records, on each input record whose priors may be taken as written, the provenance of its priors before merging
+     * changes its alleles. A record is counted, if its priors cannot be used, only at its start, since it is given
+     * again at each later position it overlaps.
+     */
+    private List<VariantContext> withGenotypePriorProvenance(final Locatable loc, final List<VariantContext> variants) {
+        final List<VariantContext> result = new ArrayList<>(variants.size());
+        for (final VariantContext vc : variants) {
+            result.add(provenanceRecorder.apply(vc, vc.getStart() == loc.getStart()));
+        }
+        return result;
+    }
+
+    /** Removes FORMAT fields from a record's genotypes. */
+    private static VariantContext withoutFormatFields(final VariantContext vc, final Set<String> keys) {
+        if (vc.getGenotypes().stream().noneMatch(g -> keys.stream().anyMatch(g::hasExtendedAttribute))) {
+            return vc;
+        }
+        final GenotypesContext genotypes = GenotypesContext.create(vc.getNSamples());
+        for (final Genotype g : vc.getGenotypes()) {
+            if (keys.stream().anyMatch(g::hasExtendedAttribute)) {
+                final Map<String, Object> attributes = new HashMap<>(g.getExtendedAttributes());
+                attributes.keySet().removeAll(keys);
+                genotypes.add(new GenotypeBuilder(g).noAttributes().attributes(attributes).make());
+            } else {
+                genotypes.add(g);
+            }
+        }
+        return new VariantContextBuilder(vc).genotypes(genotypes).make();
+    }
+
+    /**
+     * Logs how genotypes and QUALs were assigned with input genotype priors. Does nothing unless they were requested.
+     */
+    public void logInputGenotypePriorSummary() {
+        if (inputGenotypePriors != null) {
+            inputGenotypePriors.logSummary(logger);
+            provenanceRecorder.logSummary();
+        }
     }
 
 
@@ -421,6 +509,14 @@ public class GenotypeGVCFsEngine
             VCFStandardHeaderLines.addStandardInfoLines(headerLines, true, VCFConstants.DBSNP_KEY);
         }
         headerLines.add(GATKVCFHeaderLines.getFilterLine(GATKVCFConstants.LOW_QUAL_FILTER_NAME));
+        // PG_SRC only carries input priors; genotypes assigned from them carry recomputed GP and PG, described as
+        // HaplotypeCaller describes them, and no other prior fields
+        final Set<String> removedFormatKeys = inputGenotypePriors == null ? OUTPUT_EXCLUDED_FORMAT_KEYS : InputGenotypePriors.PRIOR_FORMAT_KEYS;
+        headerLines.removeIf(line -> line instanceof VCFFormatHeaderLine && removedFormatKeys.contains(((VCFFormatHeaderLine) line).getID()));
+        if (inputGenotypePriors != null) {
+            headerLines.add(GATKVCFHeaderLines.getGenotypePosteriorsFormatLine());
+            headerLines.add(GATKVCFHeaderLines.getGenotypePriorsFormatLine());
+        }
 
         final Set<String> sampleNameSet = samples.asSetOfSamples();
         outputHeader = new VCFHeader(headerLines, new TreeSet<>(sampleNameSet));
