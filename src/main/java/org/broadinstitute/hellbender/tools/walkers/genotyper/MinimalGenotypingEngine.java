@@ -2,6 +2,7 @@ package org.broadinstitute.hellbender.tools.walkers.genotyper;
 
 import htsjdk.samtools.util.Locatable;
 import htsjdk.variant.variantcontext.Allele;
+import htsjdk.variant.variantcontext.GenotypesContext;
 import htsjdk.variant.variantcontext.VariantContext;
 import org.broadinstitute.hellbender.engine.ReferenceContext;
 import org.broadinstitute.hellbender.utils.dragstr.DragstrParams;
@@ -12,6 +13,7 @@ import org.broadinstitute.hellbender.utils.dragstr.DragstrReferenceAnalyzer;
 import org.broadinstitute.hellbender.utils.variant.GATKVariantContextUtils;
 
 import java.util.Collections;
+import java.util.List;
 
 
 /**
@@ -24,6 +26,8 @@ public final class MinimalGenotypingEngine extends GenotypingEngine<StandardCall
     private final DragstrParams dragstrParams;
 
     private ReferenceContext referenceContext;
+
+    private InputGenotypePriors inputGenotypePriors = null;
 
     /**
      * Creates a new genotyping engine given the configuration parameters and the targeted set of samples
@@ -97,6 +101,23 @@ public final class MinimalGenotypingEngine extends GenotypingEngine<StandardCall
 
     public void setReferenceContext(final ReferenceContext ref) {
         referenceContext = ref;
+    }
+
+    /**
+     * Makes this engine assign genotypes from posteriors with each sample's own genotype priors where they apply
+     * (see {@link InputGenotypePriors}), and compute the site QUAL from posteriors when every sample with informative
+     * likelihoods has applicable priors.
+     *
+     * @param inputGenotypePriors the assigner, which also counts how genotypes were assigned; {@code null} to turn this off
+     */
+    public void setInputGenotypePriors(final InputGenotypePriors inputGenotypePriors) {
+        this.inputGenotypePriors = inputGenotypePriors;
+    }
+
+    @Override
+    protected InputGenotypePriors.Result assignGenotypesWithInputPriors(final VariantContext vc, final List<Allele> outputAlleles,
+                                                                        final GenotypesContext genotypes) {
+        return inputGenotypePriors == null ? null : inputGenotypePriors.assign(vc.getContig(), vc.getStart(), outputAlleles, genotypes);
     }
 
 }

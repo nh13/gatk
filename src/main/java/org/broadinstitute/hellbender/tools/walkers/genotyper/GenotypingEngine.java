@@ -187,10 +187,15 @@ public abstract class GenotypingEngine<Config extends StandardCallerArgumentColl
 
         // create the genotypes
         //TODO: omit subsetting if output alleles is not a proper subset of vc.getAlleles
-        final GenotypesContext genotypes = outputAlleles.size() == 1 ? GATKVariantContextUtils.subsetToRefOnly(vc, defaultPloidy) :
+        final GenotypesContext subsetGenotypes = outputAlleles.size() == 1 ? GATKVariantContextUtils.subsetToRefOnly(vc, defaultPloidy) :
                 AlleleSubsettingUtils.subsetAlleles(vc.getGenotypes(), defaultPloidy, vc.getAlleles(), outputAlleles, gpc, configuration.genotypeArgs.genotypeAssignmentMethod);
 
-        if (configuration.genotypeArgs.usePosteriorProbabilitiesToCalculateQual && hasPosteriors(genotypes)) {
+        final InputGenotypePriors.Result withInputPriors = outputAlleles.size() == 1 ? null :
+                assignGenotypesWithInputPriors(vc, outputAlleles, subsetGenotypes);
+        final GenotypesContext genotypes = withInputPriors == null ? subsetGenotypes : withInputPriors.getGenotypes();
+        final boolean usePosteriorQual = withInputPriors != null ? withInputPriors.allInformativeSamplesHavePosteriors()
+                : configuration.genotypeArgs.usePosteriorProbabilitiesToCalculateQual && hasPosteriors(genotypes);
+        if (usePosteriorQual) {
             final double log10NoVariantPosterior = phredNoVariantPosteriorProbability(outputAlleles, genotypes) * -.1;
             final double qualUpdate = !outputAlternativeAlleles.siteIsMonomorphic || configuration.annotateAllSitesWithPLs
                     ? log10NoVariantPosterior + 0.0 : MathUtils.log10OneMinusPow10(log10NoVariantPosterior) + 0.0;
@@ -206,6 +211,21 @@ public abstract class GenotypingEngine<Config extends StandardCallerArgumentColl
         return builder.genotypes(genotypes).attributes(attributes).make();
     }
 
+    /**
+     * Re-assigns genotypes from posteriors with each sample's own input genotype priors, for engines that support it.
+     * Called after genotypes have been assigned to the output alleles and before the site QUAL is finalized.
+     *
+     * @param vc the site being genotyped
+     * @param outputAlleles the alleles the genotypes have been subset to, reference first
+     * @param genotypes the genotypes assigned to {@code outputAlleles}
+     * @return the re-assigned genotypes and whether the site QUAL must be computed from their posteriors, or
+     * {@code null} (the default) to keep {@code genotypes} and the usual QUAL calculation
+     */
+    protected InputGenotypePriors.Result assignGenotypesWithInputPriors(final VariantContext vc, final List<Allele> outputAlleles,
+                                                                        final GenotypesContext genotypes) {
+        return null;
+    }
+
     protected double phredNoVariantPosteriorProbability(final List<Allele> alleles, final GenotypesContext gc) {
         return gc.stream()
                 .mapToDouble(gt -> extractPNoAlt(alleles, gt))
@@ -215,6 +235,10 @@ public abstract class GenotypingEngine<Config extends StandardCallerArgumentColl
 
     private double extractPNoAlt(final List<Allele> alleles, final Genotype gt) {
         final double[] gpArray = VariantContextGetters.getAttributeAsDoubleArray(gt, VCFConstants.GENOTYPE_POSTERIORS_KEY, () -> new double[]{Double.NaN}, Double.NaN);
+        // a genotype without posteriors for these alleles (e.g. one without informative likelihoods) does not contribute
+        if (gt.getPloidy() == 0 || gpArray.length != GenotypeIndexCalculator.genotypeCount(gt.getPloidy(), alleles.size())) {
+            return Double.NaN;
+        }
         return extractPNoAlt(alleles, gt, gpArray);
     }
 
