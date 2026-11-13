@@ -7,11 +7,14 @@ import org.broadinstitute.barclay.argparser.Argument;
 import org.broadinstitute.barclay.argparser.DeprecatedFeature;
 import org.broadinstitute.gatk.nativebindings.pdhmm.PDHMMNativeArguments;
 
+import java.io.Serializable;
+
 /**
  * Arguments for native PDPairHMM implementations. The native implementation runs on the calling thread and selects
  * its own kernel and memory, so every argument here is accepted for compatibility and has no effect.
  */
-public class PDPairHMMNativeArgumentCollection {
+public class PDPairHMMNativeArgumentCollection implements Serializable {
+    private static final long serialVersionUID = 1L;
     private static final Logger logger = LogManager.getLogger(PDPairHMMNativeArgumentCollection.class);
 
     public static final int THREADS = 1;

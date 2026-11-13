@@ -6,10 +6,13 @@ import org.broadinstitute.barclay.argparser.Argument;
 import org.broadinstitute.barclay.argparser.DeprecatedFeature;
 import org.broadinstitute.gatk.nativebindings.pairhmm.PairHMMNativeArguments;
 
+import java.io.Serializable;
+
 /**
  * Arguments for native PairHMM implementations
  */
-public class PairHMMNativeArgumentCollection {
+public class PairHMMNativeArgumentCollection implements Serializable {
+    private static final long serialVersionUID = 1L;
     private static final Logger logger = LogManager.getLogger(PairHMMNativeArgumentCollection.class);
 
     @DeprecatedFeature(detail = "The native PairHMM runs on the calling thread, so this argument has no effect")
