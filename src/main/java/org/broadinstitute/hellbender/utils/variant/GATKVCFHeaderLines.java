@@ -51,6 +51,22 @@ public class GATKVCFHeaderLines {
     }
 
     public static Set<VCFInfoHeaderLine> getAllInfoLines() { return Collections.unmodifiableSet(new HashSet<>(infoLines.values())); }
+
+    /**
+     * @return the FORMAT line for genotype posteriors (GP) as written by HaplotypeCaller when it assigns genotypes from posteriors
+     */
+    public static VCFFormatHeaderLine getGenotypePosteriorsFormatLine() {
+        return new VCFFormatHeaderLine(VCFConstants.GENOTYPE_POSTERIORS_KEY, VCFHeaderLineCount.G, VCFHeaderLineType.Float, "genotype posterior in Phred Scale");
+    }
+
+    /**
+     * @return the FORMAT line for genotype priors (PG) as written by HaplotypeCaller when it assigns genotypes from posteriors.
+     * Note that INFO PG ({@link #getInfoLine}) is a different, unrelated field.
+     */
+    public static VCFFormatHeaderLine getGenotypePriorsFormatLine() {
+        return new VCFFormatHeaderLine(GENOTYPE_PRIOR_KEY, VCFHeaderLineCount.G, VCFHeaderLineType.Float, "genotype priors in Phred Scale");
+    }
+
     public static Set<VCFFormatHeaderLine> getAllFormatLines() { return Collections.unmodifiableSet(new HashSet<>(formatLines.values())); }
     public static Set<VCFFilterHeaderLine> getAllFilterLines() { return Collections.unmodifiableSet(new HashSet<>(filterLines.values())); }
 
