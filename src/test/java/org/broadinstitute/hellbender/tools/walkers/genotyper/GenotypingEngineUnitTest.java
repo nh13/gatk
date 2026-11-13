@@ -1,6 +1,7 @@
 package org.broadinstitute.hellbender.tools.walkers.genotyper;
 
 import htsjdk.variant.variantcontext.*;
+import htsjdk.variant.vcf.VCFConstants;
 import org.broadinstitute.hellbender.GATKBaseTest;
 import org.broadinstitute.hellbender.utils.SimpleInterval;
 import org.broadinstitute.hellbender.utils.genotyper.IndexedSampleList;
@@ -132,6 +133,22 @@ public class GenotypingEngineUnitTest extends GATKBaseTest {
                                                                                                Allele.NON_REF_ALLELE))
                 .genotypes(gBuilder.make()).make();
         Assert.assertNotNull(getGenotypingEngine().calculateGenotypes(vc));
+    }
+
+    @Test
+    public void testNoVariantPosteriorIgnoresGenotypesWithoutPosteriorsAtSpanningDeletionSites() {
+        final List<Allele> alleles = Arrays.asList(refA, Allele.SPAN_DEL, altT);
+        final Genotype withPosteriors = new GenotypeBuilder("withGP", Arrays.asList(refA, altT))
+                .attribute(VCFConstants.GENOTYPE_POSTERIORS_KEY, new double[]{20, 0, 30, 10, 40, 50}).make();
+        final Genotype withoutPosteriors = new GenotypeBuilder("withoutGP", Arrays.asList(refA, refA)).make();
+        final Genotype withMalformedPosteriors = new GenotypeBuilder("shortGP", Arrays.asList(refA, refA))
+                .attribute(VCFConstants.GENOTYPE_POSTERIORS_KEY, new double[]{0, 10}).make();
+        final GenotypingEngine<?> engine = getGenotypingEngine();
+
+        final double expected = engine.phredNoVariantPosteriorProbability(alleles, GenotypesContext.create(withPosteriors));
+        Assert.assertFalse(Double.isNaN(expected));
+        Assert.assertEquals(engine.phredNoVariantPosteriorProbability(alleles,
+                GenotypesContext.create(withPosteriors, withoutPosteriors, withMalformedPosteriors)), expected, 1e-10);
     }
 
     @DataProvider

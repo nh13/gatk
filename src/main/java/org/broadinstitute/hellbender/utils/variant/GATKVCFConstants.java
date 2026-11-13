@@ -73,6 +73,8 @@ public final class GATKVCFConstants {
     public static final String NUMBER_OF_DISCOVERED_ALLELES_KEY =   "NDA";
     public static final String NEGATIVE_LABEL_KEY =                 "NEGATIVE_TRAIN_SITE";
     public static final String GENOTYPE_PRIOR_KEY =                 "PG";
+    public static final String GENOTYPE_PRIOR_PROVENANCE_KEY =      "PG_SRC"; //GenotypePriorProvenance
+    public static final String DRAGEN_GENOTYPE_PRIOR_KEY =          "PRI"; //Illumina DRAGEN
     public static final String POSITIVE_LABEL_KEY =                 "POSITIVE_TRAIN_SITE";
     public static final String QUAL_BY_DEPTH_KEY =                  "QD";
     public static final String AS_QUAL_BY_DEPTH_KEY =               "AS_QD";

@@ -11,6 +11,7 @@ import htsjdk.variant.vcf.VCFHeaderLine;
 import htsjdk.variant.vcf.VCFStandardHeaderLines;
 import org.broadinstitute.barclay.argparser.Argument;
 import org.broadinstitute.barclay.argparser.ArgumentCollection;
+import org.broadinstitute.barclay.argparser.CommandLineException;
 import org.broadinstitute.barclay.argparser.CommandLineProgramProperties;
 import org.broadinstitute.barclay.argparser.WorkflowProperties;
 import org.broadinstitute.barclay.argparser.WorkflowOutput;
@@ -28,14 +29,17 @@ import org.broadinstitute.hellbender.tools.walkers.annotator.Annotation;
 import org.broadinstitute.hellbender.tools.walkers.annotator.StandardAnnotation;
 import org.broadinstitute.hellbender.tools.walkers.annotator.VariantAnnotatorEngine;
 import org.broadinstitute.hellbender.tools.walkers.genotyper.GenotypeAssignmentMethod;
+import org.broadinstitute.hellbender.tools.walkers.genotyper.GenotypePriorProvenanceRecorder;
 import org.broadinstitute.hellbender.tools.walkers.mutect.filtering.Mutect2FilteringEngine;
 import org.broadinstitute.hellbender.utils.IntervalUtils;
 import org.broadinstitute.hellbender.utils.SimpleInterval;
 import org.broadinstitute.hellbender.utils.genotyper.IndexedSampleList;
+import org.broadinstitute.hellbender.utils.variant.GATKVCFConstants;
 import org.broadinstitute.hellbender.utils.variant.GATKVCFHeaderLines;
 import org.broadinstitute.hellbender.utils.variant.GATKVariantContextUtils;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Combine per-sample gVCF files produced by HaplotypeCaller into a multi-sample gVCF file
@@ -91,6 +95,7 @@ public final class CombineGVCFs extends MultiVariantWalkerGroupedOnStart {
     public static final String SOMATIC_INPUT_LONG_NAME = "input-is-somatic";
     public static final String DROP_SOMATIC_FILTERING_ANNOTATIONS_LONG_NAME = "drop-somatic-filtering-annotations";
     public static final String ALLELE_FRACTION_DELTA_LONG_NAME = "allele-fraction-error";
+    public static final String PRESERVE_GENOTYPE_PRIORS_LONG_NAME = GenotypePriorProvenanceRecorder.PRESERVE_GENOTYPE_PRIORS_LONG_NAME;
 
     @Argument(fullName= StandardArgumentDefinitions.OUTPUT_LONG_NAME,
             shortName=StandardArgumentDefinitions.OUTPUT_SHORT_NAME,
@@ -131,6 +136,20 @@ public final class CombineGVCFs extends MultiVariantWalkerGroupedOnStart {
     @Argument(fullName = GenomicsDBArgumentCollection.CALL_GENOTYPES_LONG_NAME, doc = "Output called genotypes?", optional = true)
     protected boolean makeGenotypeCalls = false;
 
+    /**
+     * Keep each sample's genotype priors (FORMAT PG, or PRI from Illumina DRAGEN) usable after combining, by recording
+     * them with the start, ploidy and alleles of the sample's record in FORMAT {@value GATKVCFConstants#GENOTYPE_PRIOR_PROVENANCE_KEY}.
+     * Merging changes alleles without remapping PG or PRI, so without this GenotypeGVCFs --use-input-genotype-priors
+     * cannot use the priors of a combined GVCF. Priors are recorded from single-sample input records, which are taken
+     * as written by the caller if the priors fit them (see GenotypeGVCFs); records from multi-sample inputs keep any
+     * provenance they already have.
+     */
+    @Argument(fullName = PRESERVE_GENOTYPE_PRIORS_LONG_NAME, optional = true, doc = GenotypePriorProvenanceRecorder.PRESERVE_GENOTYPE_PRIORS_DOC)
+    protected boolean preserveGenotypePriors = false;
+
+    // records the provenance of input records' priors; null unless they are preserved
+    private GenotypePriorProvenanceRecorder provenanceRecorder = null;
+
     @Override
     public boolean useVariantAnnotations() { return true;}
 
@@ -154,6 +173,10 @@ public final class CombineGVCFs extends MultiVariantWalkerGroupedOnStart {
 
     @Override
     public void apply(List<VariantContext> variantContexts, ReferenceContext referenceContext, final List<ReadsContext> readsContexts) {
+        if (provenanceRecorder != null) {
+            // each input record is given once, at its start
+            variantContexts = variantContexts.stream().map(vc -> provenanceRecorder.apply(vc, true)).collect(Collectors.toList());
+        }
         // Check that the input variant contexts do not contain MNPs as these may not be properly merged
         for (final VariantContext ctx : variantContexts) {
             if (GATKVariantContextUtils.isUnmixedMnpIgnoringNonRef(ctx)) {
@@ -265,6 +288,18 @@ public final class CombineGVCFs extends MultiVariantWalkerGroupedOnStart {
 
     @Override
     public void onTraversalStart() {
+        if (preserveGenotypePriors && somaticInput) {
+            throw new CommandLineException.BadArgumentValue(String.format("--%s cannot be used with --%s: somatic GVCFs have no genotype priors",
+                    PRESERVE_GENOTYPE_PRIORS_LONG_NAME, SOMATIC_INPUT_LONG_NAME));
+        }
+        if (preserveGenotypePriors) {
+            provenanceRecorder = new GenotypePriorProvenanceRecorder(true, String.format(
+                    "Combine the original single-sample GVCFs with --%s instead.", PRESERVE_GENOTYPE_PRIORS_LONG_NAME), logger);
+        } else if (getHeaderForVariants().hasFormatLine(GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY)) {
+            logger.warn(String.format("The input has %s, which records genotype priors with the alleles they were written for, but " +
+                    "--%s is not set, so it is not recorded for input records that lack it and their priors will not be usable",
+                    GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY, PRESERVE_GENOTYPE_PRIORS_LONG_NAME));
+        }
         if (somaticInput) {
             logger.warn("Note that the Mutect2 reference confidence mode is in BETA -- the likelihoods model and output format are subject to change in subsequent versions.");
         }
@@ -300,6 +335,10 @@ public final class CombineGVCFs extends MultiVariantWalkerGroupedOnStart {
         headerLines.add(VCFStandardHeaderLines.getInfoLine(VCFConstants.DEPTH_KEY));   // needed for gVCFs without DP tags
         if ( dbsnp.dbsnp != null  ) {
             VCFStandardHeaderLines.addStandardInfoLines(headerLines, true, VCFConstants.DBSNP_KEY);
+        }
+
+        if (preserveGenotypePriors) {
+            headerLines.add(GATKVCFHeaderLines.getFormatLine(GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY));
         }
 
         if (somaticInput) {
@@ -505,6 +544,9 @@ public final class CombineGVCFs extends MultiVariantWalkerGroupedOnStart {
             }
         }
 
+        if (provenanceRecorder != null) {
+            provenanceRecorder.logSummary();
+        }
         return null;
     }
 
