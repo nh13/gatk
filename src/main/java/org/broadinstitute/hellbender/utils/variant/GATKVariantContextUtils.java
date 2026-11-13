@@ -372,26 +372,44 @@ public final class GATKVariantContextUtils {
             if (gpc == null) {
                 throw new GATKException("cannot uses posteriors without an genotype prior calculator present");
             } else {
-                // Calculate posteriors.
-                final double[] log10Priors = gpc.getLog10Priors(ploidy, allelesToUse);
-                final double[] log10Posteriors = MathUtils.ebeAdd(log10Priors, genotypeLikelihoods);
-                final double[] normalizedLog10Posteriors = MathUtils.scaleLogSpaceArrayForNumericalStability(log10Posteriors);
-                // Update GP and PG annotations:
-                gb.attribute(VCFConstants.GENOTYPE_POSTERIORS_KEY, Arrays.stream(normalizedLog10Posteriors)
-                        .map(v -> v == 0.0 ? 0.0 : v * -10) // the reason for the == 0.0 is to avoid a signed 0 output "-0.0"
-                        .mapToObj(GATKVariantContextUtils::formatGP).toArray());
-                gb.attribute(GATKVCFConstants.GENOTYPE_PRIOR_KEY, Arrays.stream(log10Priors)
-                        .map(v -> v == 0.0 ? 0.0 : v * -10)
-                        .mapToObj(GATKVariantContextUtils::formatGP).toArray());
-                // Set the GQ accordingly
-                final int maxPosteriorIndex = MathUtils.maxElementIndex(log10Posteriors);
-                if ( allelesToUse.size() > 0 ) {
-                    gb.log10PError(getGQLog10FromPosteriors(maxPosteriorIndex, normalizedLog10Posteriors));
-                }
-                // Finally we update the genotype alleles.
-                gb.alleles(GenotypesCache.get(ploidy, maxPosteriorIndex).asAlleleList(allelesToUse));
+                makeGenotypeCallFromPriors(ploidy, gb, genotypeLikelihoods, allelesToUse, gpc.getLog10Priors(ploidy, allelesToUse));
             }
         }
+    }
+
+    /**
+     * Assigns the genotype with the highest posterior given likelihoods and priors, and records the posteriors (GP),
+     * the priors (PG) and the posterior-based GQ, all Phred-scaled.
+     *
+     * @param ploidy the genotype's ploidy
+     * @param gb the builder where the call is put, cannot be null
+     * @param genotypeLikelihoods the log10 genotype likelihoods, in VCF genotype order for {@code allelesToUse}
+     * @param allelesToUse the alleles the likelihoods and priors are defined for, reference first
+     * @param log10Priors the log10 genotype priors, in the same order as {@code genotypeLikelihoods}
+     */
+    public static void makeGenotypeCallFromPriors(final int ploidy, final GenotypeBuilder gb, final double[] genotypeLikelihoods,
+                                                  final List<Allele> allelesToUse, final double[] log10Priors) {
+        Utils.nonNull(gb, "gb");
+        Utils.nonNull(genotypeLikelihoods, "genotypeLikelihoods");
+        Utils.nonNull(log10Priors, "log10Priors");
+        Utils.validateArg(genotypeLikelihoods.length == log10Priors.length, "likelihoods and priors must have the same length");
+        // Calculate posteriors.
+        final double[] log10Posteriors = MathUtils.ebeAdd(log10Priors, genotypeLikelihoods);
+        final double[] normalizedLog10Posteriors = MathUtils.scaleLogSpaceArrayForNumericalStability(log10Posteriors);
+        // Update GP and PG annotations:
+        gb.attribute(VCFConstants.GENOTYPE_POSTERIORS_KEY, Arrays.stream(normalizedLog10Posteriors)
+                .map(v -> v == 0.0 ? 0.0 : v * -10) // the reason for the == 0.0 is to avoid a signed 0 output "-0.0"
+                .mapToObj(GATKVariantContextUtils::formatGP).toArray());
+        gb.attribute(GATKVCFConstants.GENOTYPE_PRIOR_KEY, Arrays.stream(log10Priors)
+                .map(v -> v == 0.0 ? 0.0 : v * -10)
+                .mapToObj(GATKVariantContextUtils::formatGP).toArray());
+        // Set the GQ accordingly
+        final int maxPosteriorIndex = MathUtils.maxElementIndex(log10Posteriors);
+        if ( allelesToUse.size() > 0 ) {
+            gb.log10PError(getGQLog10FromPosteriors(maxPosteriorIndex, normalizedLog10Posteriors));
+        }
+        // Finally we update the genotype alleles.
+        gb.alleles(GenotypesCache.get(ploidy, maxPosteriorIndex).asAlleleList(allelesToUse));
     }
 
     private static List<Allele> bestMatchToOriginalGT(final List<Allele> allelesToUse, final List<Allele> originalGT) {
