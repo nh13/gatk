@@ -9,6 +9,8 @@ import htsjdk.tribble.AbstractFeatureReader;
 import htsjdk.tribble.CloseableTribbleIterator;
 import htsjdk.tribble.FeatureReader;
 import htsjdk.tribble.TribbleException;
+import htsjdk.tribble.readers.LineIteratorImpl;
+import htsjdk.tribble.readers.SynchronousLineReader;
 import htsjdk.variant.variantcontext.VariantContext;
 import htsjdk.variant.vcf.VCFCodec;
 import htsjdk.variant.vcf.VCFFileReader;
@@ -31,6 +33,9 @@ import org.broadinstitute.hellbender.utils.SimpleInterval;
 import org.broadinstitute.hellbender.utils.Utils;
 import org.broadinstitute.hellbender.utils.gcs.BucketUtils;
 import org.broadinstitute.hellbender.utils.io.IOUtils;
+import org.broadinstitute.hellbender.tools.walkers.genotyper.GenotypePriorProvenanceRecorder;
+import org.broadinstitute.hellbender.utils.variant.GATKVCFConstants;
+import org.broadinstitute.hellbender.utils.variant.GATKVCFHeaderLines;
 import org.broadinstitute.hellbender.utils.variant.GATKVariantContextUtils;
 import org.genomicsdb.Constants;
 import org.genomicsdb.GenomicsDBUtils;
@@ -44,6 +49,7 @@ import org.genomicsdb.model.ImportConfig;
 import java.io.File;
 import java.io.IOException;
 import java.io.Serial;
+import java.io.StringReader;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
@@ -216,6 +222,7 @@ public final class GenomicsDBImport extends GATKTool {
     public static final String MAX_NUM_INTERVALS_TO_IMPORT_IN_PARALLEL = "max-num-intervals-to-import-in-parallel";
     public static final String MERGE_CONTIGS_INTO_NUM_PARTITIONS = "merge-contigs-into-num-partitions";
     public static final String BYPASS_FEATURE_READER = "bypass-feature-reader";
+    public static final String PRESERVE_GENOTYPE_PRIORS_LONG_NAME = GenotypePriorProvenanceRecorder.PRESERVE_GENOTYPE_PRIORS_LONG_NAME;
     public static final String VCF_HEADER_OVERRIDE = "header";
     public static final int INTERVAL_LIST_SIZE_WARNING_THRESHOLD = 100;
     public static final int ARRAY_COLUMN_BOUNDS_START = 0;
@@ -378,6 +385,20 @@ public final class GenomicsDBImport extends GATKTool {
             optional = true)
     private boolean bypassFeatureReader = false;
 
+    /**
+     * Keep each sample's genotype priors (FORMAT PG, or PRI from Illumina DRAGEN) usable after import, by recording them
+     * with the start, ploidy and alleles of the sample's record in FORMAT {@value GATKVCFConstants#GENOTYPE_PRIOR_PROVENANCE_KEY}.
+     * GenomicsDB merges samples' alleles, so without this GenotypeGVCFs --use-input-genotype-priors cannot use the priors.
+     * Priors are taken as written by the caller for each input record if they fit it (see GenotypeGVCFs). Requires
+     * reading the inputs with GATK's FeatureReader. An incremental import must use this option if and only if the
+     * workspace was created with it.
+     */
+    @Argument(fullName = PRESERVE_GENOTYPE_PRIORS_LONG_NAME, optional = true, doc = GenotypePriorProvenanceRecorder.PRESERVE_GENOTYPE_PRIORS_DOC)
+    private boolean preserveGenotypePriors = false;
+
+    // records the provenance of input records' priors; null unless they are preserved
+    private GenotypePriorProvenanceRecorder provenanceRecorder = null;
+
     @Argument(fullName = AVOID_NIO,
                 doc = "Do not attempt to open the input vcf file paths in java.  This can only be used with " + BYPASS_FEATURE_READER
             + ".  It allows operating on file systems which GenomicsDB understands how to open but GATK does not.  This will disable "
@@ -476,9 +497,48 @@ public final class GenomicsDBImport extends GATKTool {
         assertVariantPathsOrSampleNameFileWasSpecified();
         assertOverwriteWorkspaceAndIncrementalImportMutuallyExclusive();
         assertAvoidNioConditionsAreValid();
+        assertGenotypePriorsCanBePreserved();
         initializeHeaderAndSampleMappings();
+        if (preserveGenotypePriors) {
+            provenanceRecorder = new GenotypePriorProvenanceRecorder(true, String.format(
+                    "Import the single-sample GVCFs as written by the caller with --%s.", PRESERVE_GENOTYPE_PRIORS_LONG_NAME), logger);
+            if (mergedHeaderLines != null) {
+                mergedHeaderLines.add(GATKVCFHeaderLines.getFormatLine(GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY));
+            }
+        }
         initializeIntervals();
         super.onStartup();
+    }
+
+    private void assertGenotypePriorsCanBePreserved() {
+        if (preserveGenotypePriors && bypassFeatureReader) {
+            throw new CommandLineException.BadArgumentValue(String.format("--%s cannot be used with --%s, since htslib-read records cannot be annotated",
+                    PRESERVE_GENOTYPE_PRIORS_LONG_NAME, BYPASS_FEATURE_READER));
+        }
+        if (doIncrementalImport) {
+            // a workspace whose samples' priors are only partly usable would make GenotypeGVCFs fall back to likelihoods
+            // at every site where a sample without them has data
+            final boolean workspacePreservesPriors = readWorkspaceHeader().hasFormatLine(GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY);
+            if (preserveGenotypePriors && !workspacePreservesPriors) {
+                throw new UserException.BadInput(String.format("--%s requires a workspace created with --%s, but %s has no %s field",
+                        PRESERVE_GENOTYPE_PRIORS_LONG_NAME, PRESERVE_GENOTYPE_PRIORS_LONG_NAME, workspace, GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY));
+            }
+            if (!preserveGenotypePriors && workspacePreservesPriors) {
+                throw new UserException.BadInput(String.format("%s was created with --%s, so samples added to it must be imported with --%s too",
+                        workspace, PRESERVE_GENOTYPE_PRIORS_LONG_NAME, PRESERVE_GENOTYPE_PRIORS_LONG_NAME));
+            }
+        }
+    }
+
+    private VCFHeader readWorkspaceHeader() {
+        final String vcfHeader = IOUtils.appendPathToDir(workspace, GenomicsDBConstants.DEFAULT_VCFHEADER_FILE_NAME);
+        IOUtils.assertPathsAreReadable(vcfHeader);
+        try {
+            return (VCFHeader) new VCFCodec().readActualHeader(new LineIteratorImpl(new SynchronousLineReader(
+                    new StringReader(GenomicsDBUtils.readEntireFile(vcfHeader)))));
+        } catch (final TribbleException e) {
+            throw new UserException.BadInput("Could not read the VCF header of workspace " + workspace + ": " + e.getMessage(), e);
+        }
     }
 
 
@@ -902,6 +962,9 @@ public final class GenomicsDBImport extends GATKTool {
         } else {
             logger.info("Import of all batches to GenomicsDB completed!");
         }
+        if (provenanceRecorder != null) {
+            provenanceRecorder.logSummary();
+        }
         return true;
     }
 
@@ -978,8 +1041,13 @@ public final class GenomicsDBImport extends GATKTool {
                     BucketUtils.getPrefetchingWrapper(cloudPrefetchBuffer),
                     BucketUtils.getPrefetchingWrapper(cloudIndexPrefetchBuffer));
 
+            final Object header = reader.getHeader();
+            if (preserveGenotypePriors && header instanceof VCFHeader) {
+                ((VCFHeader) header).addMetaDataLine(GATKVCFHeaderLines.getFormatLine(GATKVCFConstants.GENOTYPE_PRIOR_PROVENANCE_KEY));
+            }
+
             /* Anonymous FeatureReader subclass that wraps returned iterators to ensure that the GVCFs do not
-             * contain MNPs.
+             * contain MNPs, and to record the provenance of genotype priors when requested.
              */
             return new FeatureReader<>() {
                 /** Iterator that asserts that variants are not MNPs. */
@@ -1000,13 +1068,13 @@ public final class GenomicsDBImport extends GATKTool {
                             ));
                         }
 
-                        return vc;
+                        return provenanceRecorder != null ? provenanceRecorder.apply(vc, true) : vc;
                     }
                 }
 
                 @Override public void close() throws IOException { reader.close(); }
                 @Override public List<String> getSequenceNames() { return reader.getSequenceNames(); }
-                @Override public Object getHeader() { return reader.getHeader(); }
+                @Override public Object getHeader() { return header; }
                 @Override public boolean isQueryable() { return reader.isQueryable(); }
 
                 @Override public CloseableTribbleIterator<VariantContext> query(Locatable locus) throws IOException {
